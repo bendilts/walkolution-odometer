@@ -1,0 +1,33 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Generated files
+*.elf
+*.uf2
+*.bin
+*.hex
+*.map
+*.dis
+*.elf.map
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# IDE
+!.vscode/*
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Backup files
+*.bak
+*.old

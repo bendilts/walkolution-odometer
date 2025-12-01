@@ -1,0 +1,39 @@
+// Walkolution Odometer GATT Service Definition
+
+PRIMARY_SERVICE, GAP_SERVICE
+CHARACTERISTIC, GAP_DEVICE_NAME, READ, "Walkolution Odo"
+
+// Odometer Service
+// Service UUID: 12345678-1234-5678-1234-56789ABCDEF0
+PRIMARY_SERVICE, 12345678-1234-5678-1234-56789ABCDEF0
+
+// Odometer Data Characteristic
+// Characteristic UUID: 12345678-1234-5678-1234-56789ABCDEF1
+// Sends 28-byte packets with session/total rotations, time, and speeds
+CHARACTERISTIC, 12345678-1234-5678-1234-56789ABCDEF1, READ | NOTIFY | DYNAMIC,
+
+// Sessions List Characteristic
+// Characteristic UUID: 12345678-1234-5678-1234-56789ABCDEF2
+// Returns array of unreported session records (20 bytes each)
+CHARACTERISTIC, 12345678-1234-5678-1234-56789ABCDEF2, READ | NOTIFY | DYNAMIC,
+
+// Mark Session Reported Characteristic
+// Characteristic UUID: 12345678-1234-5678-1234-56789ABCDEF3
+// Write 4-byte session_id to mark as reported
+CHARACTERISTIC, 12345678-1234-5678-1234-56789ABCDEF3, WRITE | DYNAMIC,
+
+// Time Sync Characteristic
+// Characteristic UUID: 12345678-1234-5678-1234-56789ABCDEF4
+// Write 4-byte Unix timestamp to sync device time
+CHARACTERISTIC, 12345678-1234-5678-1234-56789ABCDEF4, WRITE | DYNAMIC,
+
+// User Settings Characteristic
+// Characteristic UUID: 12345678-1234-5678-1234-56789ABCDEF5
+// READ: Returns current settings (193 bytes: 1 byte metric + 64 bytes SSID + 128 bytes password)
+// WRITE: Updates settings and triggers WiFi validation
+CHARACTERISTIC, 12345678-1234-5678-1234-56789ABCDEF5, READ | WRITE | DYNAMIC,
+
+// WiFi Validation Status Characteristic
+// Characteristic UUID: 12345678-1234-5678-1234-56789ABCDEF6
+// READ/NOTIFY: 1 byte status (0=idle, 1=testing, 2=success, 3=failed)
+CHARACTERISTIC, 12345678-1234-5678-1234-56789ABCDEF6, READ | NOTIFY | DYNAMIC,
