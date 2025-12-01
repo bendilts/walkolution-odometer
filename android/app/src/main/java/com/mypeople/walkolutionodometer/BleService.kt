@@ -107,6 +107,8 @@ class BleService : Service() {
     private var connectionAttemptStartTime = 0L
     private var lastGattActivityTime = 0L
     private var consecutiveFailures = 0
+    private var lastScanCallbackTime = 0L
+    private var scanStartTime = 0L
 
     // MTU negotiation
     private val desiredMtu = 185
@@ -186,7 +188,7 @@ class BleService : Service() {
         // Load cached sessions (filtering out uploaded and discarded)
         serviceScope.launch {
             val cached = sessionCacheManager.getCachedSessions()
-            if (cached.isNotEmpty() && _unreportedSessions.value.isEmpty()) {
+            if (cached.isNotEmpty()) {
                 val uploadedIds = sessionCacheManager.getUploadedSessions().map { it.sessionId }.toSet()
                 val discardedIds = sessionCacheManager.getDiscardedSessions().map { it.sessionId }.toSet()
                 val filteredCached = cached.filter {
@@ -368,6 +370,26 @@ class BleService : Service() {
                     startBluetoothScan()
                 }
 
+                // Check if scanner is stuck (scanning flag is true but no callbacks received)
+                if (_scanning.value && scanStartTime > 0) {
+                    val scanDuration = now - scanStartTime
+                    val timeSinceLastCallback = now - lastScanCallbackTime
+
+                    // If we've been "scanning" for >15 seconds with no callbacks, scanner is stuck
+                    if (scanDuration > 15000 && (lastScanCallbackTime == 0L || timeSinceLastCallback > 15000)) {
+                        Log.w(TAG, "Watchdog: Scanner stuck - scanning for ${scanDuration}ms but no callbacks for ${timeSinceLastCallback}ms")
+                        _scanning.value = false
+                        scanStartTime = 0
+                        lastScanCallbackTime = 0
+                        resetBluetoothScanner()
+
+                        mainHandler.postDelayed({
+                            Log.i(TAG, "Restarting scan after stuck detection")
+                            startBluetoothScan()
+                        }, 1000)
+                    }
+                }
+
                 // Check if GATT object exists but we're not connected
                 if (bluetoothGatt != null && !_isConnected.value && !isConnecting) {
                     val staleDuration = now - lastGattActivityTime
@@ -521,6 +543,8 @@ class BleService : Service() {
     // BLE Scanning
     private val leScanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            lastScanCallbackTime = System.currentTimeMillis()
+
             try {
                 if (!hasBluetoothConnectPermission()) {
                     Log.e(TAG, "Missing BLUETOOTH_CONNECT permission in scan callback")
@@ -557,6 +581,8 @@ class BleService : Service() {
         override fun onScanFailed(errorCode: Int) {
             Log.e(TAG, "BLE scan failed with error code: $errorCode")
             _scanning.value = false
+            scanStartTime = 0
+            lastScanCallbackTime = 0
 
             val errorMessage = when (errorCode) {
                 SCAN_FAILED_ALREADY_STARTED -> "Scan already started"
@@ -764,7 +790,7 @@ class BleService : Service() {
                         Log.i(TAG, "Time sync sent successfully")
                         mainHandler.postDelayed({
                             readUserSettings()
-                            readSessionsList()
+                            // Sessions list will be read after user settings completes
                         }, 500)
                     }
                     MARK_REPORTED_CHARACTERISTIC_UUID -> {
@@ -778,10 +804,20 @@ class BleService : Service() {
 
         override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
             lastGattActivityTime = System.currentTimeMillis()
+            Log.d(TAG, "onCharacteristicRead (API 33+): UUID=${characteristic.uuid}, status=$status, size=${value.size}")
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 when (characteristic.uuid) {
-                    SESSIONS_LIST_CHARACTERISTIC_UUID -> parseSessionsList(value)
-                    USER_SETTINGS_CHARACTERISTIC_UUID -> parseUserSettings(value)
+                    SESSIONS_LIST_CHARACTERISTIC_UUID -> {
+                        Log.i(TAG, "Sessions list read successful, ${value.size} bytes")
+                        parseSessionsList(value)
+                    }
+                    USER_SETTINGS_CHARACTERISTIC_UUID -> {
+                        parseUserSettings(value)
+                        // Chain sessions list read after user settings completes
+                        mainHandler.postDelayed({
+                            readSessionsList()
+                        }, 50)
+                    }
                     WIFI_VALIDATION_STATUS_CHARACTERISTIC_UUID -> parseWifiValidationStatus(value)
                 }
             } else {
@@ -794,14 +830,25 @@ class BleService : Service() {
         override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
             lastGattActivityTime = System.currentTimeMillis()
+            Log.d(TAG, "onCharacteristicRead (deprecated): UUID=${characteristic.uuid}, status=$status")
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 characteristic.value?.let { value ->
+                    Log.d(TAG, "Characteristic value size: ${value.size}")
                     when (characteristic.uuid) {
-                        SESSIONS_LIST_CHARACTERISTIC_UUID -> parseSessionsList(value)
-                        USER_SETTINGS_CHARACTERISTIC_UUID -> parseUserSettings(value)
+                        SESSIONS_LIST_CHARACTERISTIC_UUID -> {
+                            Log.i(TAG, "Sessions list read successful (deprecated API), ${value.size} bytes")
+                            parseSessionsList(value)
+                        }
+                        USER_SETTINGS_CHARACTERISTIC_UUID -> {
+                            parseUserSettings(value)
+                            // Chain sessions list read after user settings completes
+                            mainHandler.postDelayed({
+                                readSessionsList()
+                            }, 50)
+                        }
                         WIFI_VALIDATION_STATUS_CHARACTERISTIC_UUID -> parseWifiValidationStatus(value)
                     }
-                }
+                } ?: Log.w(TAG, "Characteristic value is null")
             } else {
                 Log.w(TAG, "Characteristic read failed: ${characteristic.uuid}, status=$status")
             }
@@ -926,16 +973,22 @@ class BleService : Service() {
             try {
                 bluetoothLeScanner?.startScan(leScanCallback)
                 _scanning.value = true
+                scanStartTime = System.currentTimeMillis()
+                lastScanCallbackTime = 0
                 _connectionStatus.value = "Scanning for device..."
                 updateNotification()
             } catch (e: SecurityException) {
                 Log.e(TAG, "SecurityException starting scan: ${e.message}")
                 _scanning.value = false
+                scanStartTime = 0
+                lastScanCallbackTime = 0
                 _connectionStatus.value = "Permission denied"
                 updateNotification()
             } catch (e: IllegalStateException) {
                 Log.e(TAG, "IllegalStateException starting scan: ${e.message}")
                 _scanning.value = false
+                scanStartTime = 0
+                lastScanCallbackTime = 0
                 _connectionStatus.value = "Bluetooth error"
                 updateNotification()
                 // Retry with backoff
@@ -946,6 +999,8 @@ class BleService : Service() {
             } catch (e: Exception) {
                 Log.e(TAG, "Exception starting scan: ${e.message}")
                 _scanning.value = false
+                scanStartTime = 0
+                lastScanCallbackTime = 0
                 _connectionStatus.value = "Scan failed"
                 updateNotification()
             }
@@ -955,6 +1010,8 @@ class BleService : Service() {
     private fun stopBluetoothScan() {
         if (!hasBluetoothPermissions()) {
             _scanning.value = false
+            scanStartTime = 0
+            lastScanCallbackTime = 0
             return
         }
 
@@ -967,6 +1024,8 @@ class BleService : Service() {
                 Log.e(TAG, "Exception stopping scan: ${e.message}")
             } finally {
                 _scanning.value = false
+                scanStartTime = 0
+                lastScanCallbackTime = 0
             }
         }
     }
@@ -1022,14 +1081,26 @@ class BleService : Service() {
     }
 
     private fun readSessionsList() {
-        if (!hasBluetoothConnectPermission()) return
+        if (!hasBluetoothConnectPermission()) {
+            Log.w(TAG, "readSessionsList: No Bluetooth connect permission")
+            return
+        }
 
         val service = bluetoothGatt?.getService(ODOMETER_SERVICE_UUID)
-        val characteristic = service?.getCharacteristic(SESSIONS_LIST_CHARACTERISTIC_UUID)
-        if (characteristic != null) {
-            Log.d(TAG, "Reading sessions list characteristic...")
-            bluetoothGatt?.readCharacteristic(characteristic)
+        if (service == null) {
+            Log.w(TAG, "readSessionsList: Service not found")
+            return
         }
+
+        val characteristic = service.getCharacteristic(SESSIONS_LIST_CHARACTERISTIC_UUID)
+        if (characteristic == null) {
+            Log.w(TAG, "readSessionsList: Characteristic not found")
+            return
+        }
+
+        Log.d(TAG, "Reading sessions list characteristic... UUID=${characteristic.uuid}")
+        val result = bluetoothGatt?.readCharacteristic(characteristic)
+        Log.d(TAG, "readCharacteristic returned: $result")
     }
 
     private fun parseSessionsList(data: ByteArray) {
@@ -1249,7 +1320,7 @@ class BleService : Service() {
 
     // Called when service is re-bound (e.g., app returns to foreground)
     fun onAppResumed() {
-        Log.i(TAG, "App resumed, checking connection state")
+        Log.i(TAG, "App resumed, checking connection state - connected=${_isConnected.value}, connecting=$isConnecting, scanning=${_scanning.value}")
 
         // Check if Bluetooth is still enabled
         if (bluetoothAdapter?.isEnabled != true) {
@@ -1280,6 +1351,8 @@ class BleService : Service() {
             pendingScanRunnable = null
             resetBluetoothScanner()
             startBluetoothScan()
+        } else {
+            Log.i(TAG, "Skipping scan restart - already in desired state")
         }
     }
 
