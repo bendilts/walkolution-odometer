@@ -447,7 +447,16 @@ class BleService : Service() {
 
     private fun resetBluetoothScanner() {
         if (hasBluetoothPermissions()) {
+            // First, aggressively stop any existing scans
+            try {
+                bluetoothLeScanner?.stopScan(leScanCallback)
+                Log.d(TAG, "Force stopped existing scan during reset")
+            } catch (e: Exception) {
+                Log.d(TAG, "Exception during force stop (may be expected): ${e.message}")
+            }
+
             stopBluetoothScan()
+
             // Force re-get the scanner instance
             bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
             Log.i(TAG, "BLE scanner reset")
@@ -594,6 +603,12 @@ class BleService : Service() {
             _connectionStatus.value = "Scan failed: $errorMessage"
             updateNotification()
 
+            // Special handling for SCAN_FAILED_ALREADY_STARTED
+            if (errorCode == SCAN_FAILED_ALREADY_STARTED) {
+                handleScanAlreadyStartedError()
+                return
+            }
+
             // Increment failure counter and retry with backoff
             consecutiveFailures++
 
@@ -605,6 +620,23 @@ class BleService : Service() {
                 startBluetoothScan()
             }.also { mainHandler.postDelayed(it, minOf(consecutiveFailures * 2000L, 10000L)) }
         }
+    }
+
+    private fun handleScanAlreadyStartedError() {
+        Log.w(TAG, "Scan already started - forcing stop before retry")
+        // Force stop any existing scan
+        try {
+            bluetoothLeScanner?.stopScan(leScanCallback)
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception force-stopping scan: ${e.message}")
+        }
+
+        // Retry quickly after forcing stop
+        pendingScanRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingScanRunnable = Runnable {
+            Log.i(TAG, "Retrying scan after forced stop")
+            startBluetoothScan()
+        }.also { mainHandler.postDelayed(it, 500) }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -1015,18 +1047,19 @@ class BleService : Service() {
             return
         }
 
-        if (_scanning.value) {
-            try {
-                bluetoothLeScanner?.stopScan(leScanCallback)
-            } catch (e: SecurityException) {
-                Log.e(TAG, "SecurityException stopping scan: ${e.message}")
-            } catch (e: Exception) {
-                Log.e(TAG, "Exception stopping scan: ${e.message}")
-            } finally {
-                _scanning.value = false
-                scanStartTime = 0
-                lastScanCallbackTime = 0
-            }
+        // Always try to stop scan, even if we think it's not running
+        // This handles cases where Android has a stale scan registered
+        try {
+            bluetoothLeScanner?.stopScan(leScanCallback)
+            Log.d(TAG, "stopScan() called")
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException stopping scan: ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception stopping scan: ${e.message}")
+        } finally {
+            _scanning.value = false
+            scanStartTime = 0
+            lastScanCallbackTime = 0
         }
     }
 
