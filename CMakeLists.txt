@@ -38,7 +38,9 @@ pico_sdk_init()
 add_executable(walkolution-odometer
     walkolution-odometer.c
     odometer.c
-    lcd_i2c.c
+    oled.c
+    adafruit_fonts.c
+    icons.c
     user_settings.c
     )
 
@@ -52,6 +54,7 @@ target_link_libraries(walkolution-odometer
     hardware_sync
     hardware_i2c
     hardware_adc
+    pico_multicore
 )
 
 if (PICO_CYW43_SUPPORTED)

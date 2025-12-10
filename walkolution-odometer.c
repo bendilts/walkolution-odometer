@@ -5,10 +5,14 @@
  */
 
 #include "pico/stdlib.h"
+#include "hardware/i2c.h"
 #include "odometer.h"
-#include "lcd_i2c.h"
+#include "oled.h"
+#include "font.h"
+#include "icons.h"
 #include "user_settings.h"
 #include <string.h>
+#include <stdio.h>
 
 // Pico W devices use a GPIO on the WIFI chip for the LED,
 // so when building for Pico W, CYW43_WL_GPIO_LED_PIN will be defined
@@ -30,7 +34,7 @@
 #define WIFI_NTP_TOTAL_TIMEOUT_MS 25000 // Absolute maximum time for entire WiFi+NTP process
 
 #ifndef SENSOR_PIN
-#define SENSOR_PIN 17
+#define SENSOR_PIN 28
 #endif
 
 #ifndef POLL_DELAY_MS
@@ -54,13 +58,19 @@
 #define LED_FLASH_MS 50
 #endif
 
-#ifndef LCD_UPDATE_INTERVAL_MS
-#define LCD_UPDATE_INTERVAL_MS 500
+#ifndef OLED_UPDATE_INTERVAL_MS
+#define OLED_UPDATE_INTERVAL_MS 500
 #endif
 
 #ifndef DISPLAY_SWITCH_INTERVAL_MS
 #define DISPLAY_SWITCH_INTERVAL_MS 5000
 #endif
+
+// OLED I2C configuration
+#define OLED_I2C_PORT i2c1
+#define OLED_SDA_PIN 26
+#define OLED_SCL_PIN 27
+#define OLED_ADDR 0x3C
 
 #ifndef VOLTAGE_CHECK_INTERVAL_MS
 #define VOLTAGE_CHECK_INTERVAL_MS 1000
@@ -169,53 +179,61 @@ void get_clock_time_str(char *buffer, size_t size)
     snprintf(buffer, size, "%lu:%02lu %s", hours, minutes, am_pm);
 }
 
-// Format a 16-character LCD row with proper padding
-// Ensures all rows are exactly 16 characters to prevent display artifacts
-static void format_lcd_row(char *buffer, const char *left, const char *right)
+// Forward declarations
+static float calculate_running_avg_speed(void);
+
+// Draw common status bar at bottom of display
+// Shows: Clock (left) | Voltage (center) | Connection icon (right)
+static void draw_status_bar(bool wifi_connected, bool ble_connected, bool ble_advertising)
 {
-    int left_len = left ? strlen(left) : 0;
-    int right_len = right ? strlen(right) : 0;
-    int padding = 16 - left_len - right_len;
-    if (padding < 0)
-        padding = 0;
+    // Get voltage
+    uint16_t voltage_mv = odometer_read_voltage();
+    float voltage_v = voltage_mv / 1000.0f;
+    char voltage_str[16];
+    snprintf(voltage_str, sizeof(voltage_str), "%.1fV", voltage_v);
 
-    // Build exactly 16 characters
-    int pos = 0;
+    // Get clock time
+    char clock_str[16];
+    get_clock_time_str(clock_str, sizeof(clock_str));
 
-    // Copy left text
-    if (left)
+    const int SEPARATOR_Y = 51;
+    const int TEXT_BASELINE_Y = 63;
+    oled_fill_rect(0, SEPARATOR_Y, OLED_WIDTH, 1, true);
+
+    // Clock on left (if available)
+    if (clock_str[0] != '\0')
     {
-        for (int i = 0; i < left_len && pos < 16; i++)
+        oled_draw_text(1, TEXT_BASELINE_Y, clock_str, &Font5x7Fixed);
+    }
+
+    // Voltage centered
+    oled_draw_text_centered(OLED_WIDTH / 2, TEXT_BASELINE_Y, voltage_str, &Font5x7Fixed);
+
+    // Connection icon on right
+    if (wifi_connected)
+    {
+        oled_draw_bitmap(OLED_WIDTH - icon_wifi.width, OLED_HEIGHT - icon_wifi.height,
+                         icon_wifi.bitmap, icon_wifi.width, icon_wifi.height);
+    }
+    else if (ble_connected)
+    {
+        oled_draw_bitmap(OLED_WIDTH - icon_bluetooth.width, OLED_HEIGHT - icon_bluetooth.height,
+                         icon_bluetooth.bitmap, icon_bluetooth.width, icon_bluetooth.height);
+    }
+    else if (ble_advertising)
+    {
+        // BLE advertising - flash icon every 250ms
+        uint32_t current_time_ms = to_ms_since_boot(get_absolute_time());
+        bool show_icon = ((current_time_ms / 250) % 2) == 0;
+        if (show_icon)
         {
-            buffer[pos++] = left[i];
+            oled_draw_bitmap(OLED_WIDTH - icon_bluetooth.width, OLED_HEIGHT - icon_bluetooth.height,
+                             icon_bluetooth.bitmap, icon_bluetooth.width, icon_bluetooth.height);
         }
     }
-
-    // Add padding spaces
-    for (int i = 0; i < padding && pos < 16; i++)
-    {
-        buffer[pos++] = ' ';
-    }
-
-    // Copy right text
-    if (right)
-    {
-        for (int i = 0; i < right_len && pos < 16; i++)
-        {
-            buffer[pos++] = right[i];
-        }
-    }
-
-    // Fill remainder with spaces (safety)
-    while (pos < 16)
-    {
-        buffer[pos++] = ' ';
-    }
-
-    buffer[16] = '\0';
 }
 
-void update_lcd_session(void)
+void update_oled_session(bool wifi_connected_state, bool ble_connected_state, bool ble_advertising_state)
 {
     uint32_t session = odometer_get_session_count();
     uint32_t session_time = odometer_get_session_active_time_seconds();
@@ -228,7 +246,7 @@ void update_lcd_session(void)
     const char *unit = metric ? "km" : "mi";
 
     // Format distance with appropriate precision
-    char distance_str[12];
+    char distance_str[32];
     if (session_distance >= 10.0f)
     {
         snprintf(distance_str, sizeof(distance_str), "%.1f %s", session_distance, unit);
@@ -238,39 +256,48 @@ void update_lcd_session(void)
         snprintf(distance_str, sizeof(distance_str), "%.2f %s", session_distance, unit);
     }
 
-    // Format session time (right-aligned)
-    char time_str[12];
+    // Format clock time
+    char clock_str[16];
+    get_clock_time_str(clock_str, sizeof(clock_str));
+
+    // Format session time (HH:MM:SS or MM:SS)
+    char session_time_str[16];
     if (session_time >= 3600)
     {
-        // >= 1 hour: show hours:minutes
         uint32_t hours = session_time / 3600;
         uint32_t minutes = (session_time % 3600) / 60;
-        snprintf(time_str, sizeof(time_str), "%lu:%02lu", hours, minutes);
+        uint32_t seconds = session_time % 60;
+        snprintf(session_time_str, sizeof(session_time_str), "%lu:%02lu:%02lu", hours, minutes, seconds);
     }
     else
     {
-        // < 1 hour: show minutes:seconds
         uint32_t minutes = session_time / 60;
         uint32_t seconds = session_time % 60;
-        snprintf(time_str, sizeof(time_str), "%lu:%02lu", minutes, seconds);
+        snprintf(session_time_str, sizeof(session_time_str), "%lu:%02lu", minutes, seconds);
     }
 
-    // Top row: distance (left) + time (right-aligned)
-    char row1[17];
-    format_lcd_row(row1, distance_str, time_str);
+    // Clear display
+    oled_clear();
 
-    // Bottom row: clock time (left) + connection status indicator will be added separately
-    char clock_str[12];
-    get_clock_time_str(clock_str, sizeof(clock_str));
+    // Layout: Main content area (0-52), separator (53), status bar (54-63)
+    // Display height: 64px, Font5x7Fixed height: ~8px
 
-    char row2[17];
-    format_lcd_row(row2, clock_str[0] != '\0' ? clock_str : "", "");
+    // SESSION CONTENT AREA: Distance (large) and session time (small)
 
-    lcd_print_at(0, 0, row1);
-    lcd_print_at(0, 1, row2);
+    // Large centered distance (FreeSans18pt, baseline at y=24)
+    oled_draw_text_centered(OLED_WIDTH / 2, 24, distance_str, &FreeSans18pt7b);
+
+    // Centered session time below (FreeSans9pt7b, baseline at y=42)
+    oled_draw_text_centered(OLED_WIDTH / 2, 42, session_time_str, &FreeSans9pt7b);
+
+    // Draw status bar (clock, voltage, connection icon)
+    draw_status_bar(wifi_connected_state, ble_connected_state, ble_advertising_state);
+
+    // Request display update
+    oled_update();
 }
 
-void update_lcd_totals(void)
+void update_oled_totals(bool wifi_connected_state, bool ble_connected_state, bool ble_advertising_state)
 {
     uint32_t total = odometer_get_count();
     uint32_t total_time = odometer_get_active_time_seconds();
@@ -278,37 +305,76 @@ void update_lcd_totals(void)
     // Get metric setting
     bool metric = user_settings_is_metric();
 
-    // Convert to distance (miles or km, truncate decimals)
+    // Convert to distance (miles or km)
     float total_distance = rotations_to_distance(total, metric);
-    uint32_t distance_int = (uint32_t)total_distance;
     const char *unit = metric ? "km" : "mi";
 
-    // Convert to hours (truncate decimals)
+    // Convert to hours
     uint32_t total_hours = total_time / 3600;
 
     // Get voltage
     uint16_t voltage_mv = odometer_read_voltage();
     float voltage_v = voltage_mv / 1000.0f;
 
-    // Format row 1: "XXX km total" (left-aligned, padded to 16)
-    char distance_label[17];
-    snprintf(distance_label, sizeof(distance_label), "%lu %s total", distance_int, unit);
+    // Format strings
+    char distance_str[32];
+    if (total_distance >= 100.0f)
+    {
+        snprintf(distance_str, sizeof(distance_str), "%.0f %s", total_distance, unit);
+    }
+    else if (total_distance >= 10.0f)
+    {
+        snprintf(distance_str, sizeof(distance_str), "%.1f %s", total_distance, unit);
+    }
+    else
+    {
+        snprintf(distance_str, sizeof(distance_str), "%.2f %s", total_distance, unit);
+    }
 
-    char row1[17];
-    format_lcd_row(row1, distance_label, "");
+    // Format totals with "total" label
+    char distance_total_str[32];
+    if (total_distance >= 100.0f)
+    {
+        snprintf(distance_total_str, sizeof(distance_total_str), "%.0f total %s", total_distance, unit);
+    }
+    else if (total_distance >= 10.0f)
+    {
+        snprintf(distance_total_str, sizeof(distance_total_str), "%.1f total %s", total_distance, unit);
+    }
+    else
+    {
+        snprintf(distance_total_str, sizeof(distance_total_str), "%.2f total %s", total_distance, unit);
+    }
 
-    // Format row 2: "XXX hr total" (left) + voltage (right, e.g. "4.2v")
-    char time_label[17];
-    snprintf(time_label, sizeof(time_label), "%lu hr", total_hours);
+    char hours_total_str[32];
+    snprintf(hours_total_str, sizeof(hours_total_str), "%lu total hr", total_hours);
 
-    char voltage_str[8];
-    snprintf(voltage_str, sizeof(voltage_str), "%.1fv", voltage_v);
+    // Format clock time for status bar
+    char clock_str[16];
+    get_clock_time_str(clock_str, sizeof(clock_str));
 
-    char row2[17];
-    format_lcd_row(row2, time_label, voltage_str);
+    char voltage_str[16];
+    snprintf(voltage_str, sizeof(voltage_str), "%.1fV", voltage_v);
 
-    lcd_print_at(0, 0, row1);
-    lcd_print_at(0, 1, row2);
+    // Clear display
+    oled_clear();
+
+    // Layout: Main content area (0-52), separator (53), status bar (54-63)
+    // Display height: 64px, FreeSans12pt y_advance: 29px
+
+    // TOTALS CONTENT AREA: Distance and hours (both medium, centered)
+
+    // Total distance centered (FreeSans12pt, baseline at y=18)
+    oled_draw_text_centered(OLED_WIDTH / 2, 18, distance_total_str, &FreeSans12pt7b);
+
+    // Total hours centered below (FreeSans12pt, baseline at y=42)
+    oled_draw_text_centered(OLED_WIDTH / 2, 42, hours_total_str, &FreeSans12pt7b);
+
+    // Draw status bar (clock, voltage, connection icon)
+    draw_status_bar(wifi_connected_state, ble_connected_state, ble_advertising_state);
+
+    // Request display update
+    oled_update();
 }
 
 // Bluetooth LE state
@@ -319,55 +385,7 @@ static hci_con_handle_t connection_handle;
 // Note: odometer_characteristic_handle is defined in the generated header as:
 // ATT_CHARACTERISTIC_12345678_1234_5678_1234_56789ABCDEF1_01_VALUE_HANDLE
 
-void update_connection_status_indicator(bool wifi_connected_state, bool show_on_session_screen)
-{
-    // Only show connection status on session screen, not on totals screen
-    if (!show_on_session_screen)
-    {
-        return;
-    }
-
-    // Better spinner animation for HD44780 LCD displays
-    // Clockwise rotation: |  /  -  \
-    // These characters are universally supported and look clean on LCD
-    static const char animation_chars[] = {
-        '-',
-        '+',
-        '*',
-        '+',
-    };
-    size_t animation_chars_length = 4;
-
-    char status_str[5];
-
-    if (wifi_connected_state)
-    {
-        // Show "WiFi" when WiFi is connected
-        snprintf(status_str, sizeof(status_str), "WiFi");
-    }
-    else if (ble_connected)
-    {
-        // Show "BT" when BLE connected but not WiFi
-        snprintf(status_str, sizeof(status_str), "  BT");
-    }
-    else if (ble_advertising)
-    {
-        // Show spinning animation when advertising but not connected
-        // Select character based on elapsed time (250ms per frame)
-        uint32_t current_time_ms = to_ms_since_boot(get_absolute_time());
-        int animation_index = (current_time_ms / CONNECTION_STATUS_ANIMATION_MS) % animation_chars_length;
-        char spinner = animation_chars[animation_index];
-        snprintf(status_str, sizeof(status_str), "BT %c", spinner);
-    }
-    else
-    {
-        // Show spaces when nothing is active
-        snprintf(status_str, sizeof(status_str), "    ");
-    }
-
-    // Print to bottom-right corner (position 12 on row 1)
-    lcd_print_at(12, 1, status_str);
-}
+// Connection status is now integrated into update_oled_session() and update_oled_totals()
 
 // Speed calculation
 typedef struct
@@ -917,10 +935,11 @@ static bool validate_wifi_credentials_sync(const char *ssid, const char *passwor
     printf("[WIFI-VAL] Starting synchronous WiFi validation\n");
     printf("[WIFI-VAL] SSID: %s\n", ssid);
 
-    // Show "Testing WiFi..." on LCD
-    lcd_clear();
-    lcd_print_at(0, 0, "Testing WiFi...");
-    lcd_print_at(0, 1, ssid);
+    // Show "Testing WiFi..." on OLED
+    oled_clear();
+    oled_draw_text(0, 20, "Testing WiFi...", &FreeSans9pt7b);
+    oled_draw_text(0, 40, ssid, &FreeSans9pt7b);
+    oled_update();
 
     user_settings_set_validation_status(WIFI_VALIDATION_TESTING);
 
@@ -938,19 +957,22 @@ static bool validate_wifi_credentials_sync(const char *ssid, const char *passwor
     if (result != 0)
     {
         printf("[WIFI-VAL] WiFi connection FAILED (error %d)\n", result);
-        lcd_clear();
-        lcd_print_at(0, 0, "WiFi Failed!");
-        lcd_print_at(0, 1, "Check creds");
+        oled_clear();
+        oled_draw_text(0, 20, "WiFi Failed!", &FreeSans9pt7b);
+        oled_draw_text(0, 40, "Check creds", &FreeSans9pt7b);
+        oled_update();
         user_settings_set_validation_status(WIFI_VALIDATION_FAILED);
         sleep_ms(2000); // Show message for 2 seconds
-        lcd_clear();
+        oled_clear();
+        oled_update();
         return false; // Validation failed
     }
 
     printf("[WIFI-VAL] WiFi connected! Attempting NTP sync...\n");
-    lcd_clear();
-    lcd_print_at(0, 0, "WiFi OK!");
-    lcd_print_at(0, 1, "Getting time...");
+    oled_clear();
+    oled_draw_text(0, 20, "WiFi OK!", &FreeSans9pt7b);
+    oled_draw_text(0, 40, "Getting time...", &FreeSans9pt7b);
+    oled_update();
     sleep_ms(500);
 
     // Initialize and start SNTP
@@ -994,24 +1016,28 @@ static bool validate_wifi_credentials_sync(const char *ssid, const char *passwor
     if (ntp_success)
     {
         printf("[WIFI-VAL] Validation SUCCESS\n");
-        lcd_clear();
-        lcd_print_at(0, 0, "WiFi Success!");
-        lcd_print_at(0, 1, "Time synced");
+        oled_clear();
+        oled_draw_text(0, 20, "WiFi Success!", &FreeSans9pt7b);
+        oled_draw_text(0, 40, "Time synced", &FreeSans9pt7b);
+        oled_update();
         user_settings_set_validation_status(WIFI_VALIDATION_SUCCESS);
         sleep_ms(2000); // Show message for 2 seconds
-        lcd_clear();
+        oled_clear();
+        oled_update();
         printf("[WIFI-VAL] Validation complete - SUCCESS\n");
         return true; // Validation succeeded
     }
     else
     {
         printf("[WIFI-VAL] NTP timeout - WiFi works but no time sync\n");
-        lcd_clear();
-        lcd_print_at(0, 0, "WiFi OK!");
-        lcd_print_at(0, 1, "No time sync");
+        oled_clear();
+        oled_draw_text(0, 20, "WiFi OK!", &FreeSans9pt7b);
+        oled_draw_text(0, 40, "No time sync", &FreeSans9pt7b);
+        oled_update();
         user_settings_set_validation_status(WIFI_VALIDATION_FAILED);
         sleep_ms(2000); // Show message for 2 seconds
-        lcd_clear();
+        oled_clear();
+        oled_update();
         printf("[WIFI-VAL] Validation complete - FAILED\n");
         return false; // Validation failed
     }
@@ -1191,15 +1217,6 @@ int main()
     hard_assert(rc == PICO_OK);
     printf("LED init OK\n");
 
-    // Blink LED 3 times on startup to validate it's working
-    for (int i = 0; i < 3; i++)
-    {
-        pico_set_led(true);
-        sleep_ms(200);
-        pico_set_led(false);
-        sleep_ms(200);
-    }
-
     // Initialize Bluetooth with async context
     printf("Initializing Bluetooth stack...\n");
     btstack_packet_callback_registration_t hci_event_callback_registration;
@@ -1228,27 +1245,28 @@ int main()
     printf("Initializing user settings...\n");
     user_settings_init();
 
-    // Initialize LCD - try 0x27 first, then 0x3F if that doesn't work
-    // Common I2C addresses for LCD: 0x27, 0x3F, 0x20, 0x38
-    printf("Initializing LCD...\n");
-    lcd_init(0x27, 16, 2); // Backlight starts off by default, will be enabled based on voltage
+    // Initialize OLED display (starts rendering thread on core 1)
+    printf("Initializing OLED display...\n");
+    oled_init(OLED_I2C_PORT, OLED_SDA_PIN, OLED_SCL_PIN, OLED_ADDR);
 
     // Initialize odometer sensor
     printf("Initializing odometer sensor on pin %d...\n", SENSOR_PIN);
     odometer_init(SENSOR_PIN);
 
-    // Show startup message
-    lcd_clear();
-    lcd_print_at(0, 0, "Walkolution");
+    // Show startup message (centered, 12pt to fit on screen)
+    oled_clear();
+    oled_draw_text_centered(OLED_WIDTH / 2, 28, "Walkolution", &FreeSans12pt7b);
 
     // Read and display voltage
     printf("Reading voltage...\n");
     uint16_t voltage_mv = odometer_read_voltage();
     printf("Voltage: %u mV\n", voltage_mv);
-    char voltage_str[17];
-    snprintf(voltage_str, sizeof(voltage_str), "V: %.2fV", voltage_mv / 1000.0f);
-    lcd_print_at(0, 1, voltage_str);
-    sleep_ms(2000);
+    char voltage_str[32];
+    snprintf(voltage_str, sizeof(voltage_str), "%.2fV", voltage_mv / 1000.0f);
+    oled_draw_text_centered(OLED_WIDTH / 2, 48, voltage_str, &FreeSans9pt7b);
+    oled_update();
+
+    sleep_ms(2000); // Show startup screen for 2 seconds
 
     // Set LED callback for visual feedback
     odometer_set_led_callback(pico_set_led);
@@ -1262,12 +1280,10 @@ int main()
     uint32_t last_display_switch_ms = to_ms_since_boot(get_absolute_time());
     uint32_t last_update_ms = 0;
     uint32_t last_voltage_check_ms = 0;
-    bool backlight_on = false; // Track current backlight state
 
     // BLE data update tracking
     uint32_t last_ble_update_ms = 0;
     uint32_t last_speed_window_update_ms = 0;
-    uint32_t last_connection_status_update_ms = 0;
 
     // NTP fallback timing
     uint32_t ble_advertising_start_ms = 0;
@@ -1280,9 +1296,8 @@ int main()
 #endif
 
     // Initial display
-    printf("Updating initial LCD display...\n");
-    update_lcd_session();
-    update_connection_status_indicator(wifi_connected, true); // showing_session = true initially
+    printf("Updating initial OLED display...\n");
+    update_oled_session(wifi_connected, ble_connected, ble_advertising);
 
     printf("=== ENTERING MAIN LOOP ===\n");
     printf("BLE_VOLTAGE_THRESHOLD_MV = %d\n", BLE_VOLTAGE_THRESHOLD_MV);
@@ -1307,22 +1322,13 @@ int main()
         bool sensor_state = gpio_get(SENSOR_PIN);
         pico_set_led(sensor_state);
 
-        // Check voltage periodically and control backlight and BLE
+        // Check voltage periodically and control BLE
         if ((current_time_ms - last_voltage_check_ms) >= VOLTAGE_CHECK_INTERVAL_MS)
         {
             uint16_t voltage_mv = odometer_read_voltage();
-            bool should_backlight_be_on = (voltage_mv >= BACKLIGHT_VOLTAGE_THRESHOLD_MV);
 
-            printf("[%lu] Voltage check: %u mV, backlight=%d, ble_advertising=%d, ble_connected=%d\n",
-                   current_time_ms, voltage_mv, backlight_on, ble_advertising, ble_connected);
-
-            // Only change backlight state if needed
-            if (should_backlight_be_on != backlight_on)
-            {
-                lcd_backlight(should_backlight_be_on);
-                backlight_on = should_backlight_be_on;
-                printf("Backlight changed to %d\n", backlight_on);
-            }
+            printf("[%lu] Voltage check: %u mV, ble_advertising=%d, ble_connected=%d\n",
+                   current_time_ms, voltage_mv, ble_advertising, ble_connected);
 
             // Start BLE advertising based on voltage (only check for starting, never stop once started)
             if (voltage_mv >= BLE_VOLTAGE_THRESHOLD_MV && !ble_advertising)
@@ -1389,13 +1395,6 @@ int main()
             last_ble_update_ms = current_time_ms;
         }
 
-        // Update connection status indicator on LCD (only on session screen)
-        if ((current_time_ms - last_connection_status_update_ms) >= CONNECTION_STATUS_ANIMATION_MS)
-        {
-            update_connection_status_indicator(wifi_connected, showing_session);
-            last_connection_status_update_ms = current_time_ms;
-        }
-
         // Switch display mode every 5 seconds
         if ((current_time_ms - last_display_switch_ms) >= DISPLAY_SWITCH_INTERVAL_MS)
         {
@@ -1404,27 +1403,33 @@ int main()
 
             if (showing_session)
             {
-                update_lcd_session();
+                update_oled_session(wifi_connected, ble_connected, ble_advertising);
             }
             else
             {
-                update_lcd_totals();
+                update_oled_totals(wifi_connected, ble_connected, ble_advertising);
             }
-            update_connection_status_indicator(wifi_connected, showing_session); // Refresh connection indicator after display update
             last_update_ms = current_time_ms;
         }
-        // Update session display frequently (every 500ms for smooth time updates)
-        else if (showing_session && (current_time_ms - last_update_ms) >= LCD_UPDATE_INTERVAL_MS)
+        // Update display frequently when advertising (250ms for smooth flashing animation)
+        // Otherwise update every 500ms for smooth time updates
+        uint32_t update_interval = (ble_advertising && !ble_connected) ? 250 : OLED_UPDATE_INTERVAL_MS;
+
+        if (showing_session && (current_time_ms - last_update_ms) >= update_interval)
         {
-            update_lcd_session();
-            update_connection_status_indicator(wifi_connected, showing_session); // Refresh connection indicator after display update
+            update_oled_session(wifi_connected, ble_connected, ble_advertising);
+            last_update_ms = current_time_ms;
+        }
+        // Also update totals screen when advertising for flashing animation
+        else if (!showing_session && ble_advertising && !ble_connected && (current_time_ms - last_update_ms) >= 250)
+        {
+            update_oled_totals(wifi_connected, ble_connected, ble_advertising);
             last_update_ms = current_time_ms;
         }
         // Update session display on rotation when showing session
         else if (showing_session && rotation_detected)
         {
-            update_lcd_session();
-            update_connection_status_indicator(wifi_connected, showing_session); // Refresh connection indicator after display update
+            update_oled_session(wifi_connected, ble_connected, ble_advertising);
             last_update_ms = to_ms_since_boot(get_absolute_time());
         }
 
