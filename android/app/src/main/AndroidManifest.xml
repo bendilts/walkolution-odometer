@@ -38,7 +38,6 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTask"
             android:label="@string/app_name"
             android:theme="@style/Theme.WalkolutionOdometer">
             <intent-filter>
@@ -46,7 +45,29 @@
 
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+        </activity>
 
+        <!-- Settings Activity -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="Settings"
+            android:theme="@style/Theme.WalkolutionOdometer" />
+
+        <!-- Set Lifetime Totals Activity -->
+        <activity
+            android:name=".SetLifetimeTotalsActivity"
+            android:exported="false"
+            android:label="Set Lifetime Totals"
+            android:theme="@style/Theme.WalkolutionOdometer" />
+
+        <!-- Strava Settings Activity -->
+        <activity
+            android:name=".StravaSettingsActivity"
+            android:exported="true"
+            android:label="Strava Settings"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.WalkolutionOdometer">
             <!-- Strava OAuth callback -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
@@ -57,13 +78,6 @@
                     android:host="walkolution" />
             </intent-filter>
         </activity>
-
-        <!-- Settings Activity -->
-        <activity
-            android:name=".SettingsActivity"
-            android:exported="false"
-            android:label="Settings"
-            android:theme="@style/Theme.WalkolutionOdometer" />
 
         <!-- BLE Background Service -->
         <service

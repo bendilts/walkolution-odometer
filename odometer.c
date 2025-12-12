@@ -1009,6 +1009,36 @@ uint32_t odometer_get_boot_active_time_seconds(void)
     return total;
 }
 
+// Set lifetime totals (for transferring progress to a new device)
+void odometer_set_lifetime_totals(float hours, float distance_miles)
+{
+    // Convert distance from miles to rotations
+    // Each rotation = 34.56 cm = 0.3456 meters = 0.0002147 miles
+    const float MILES_PER_ROTATION = 0.0002147f;
+    uint32_t rotations = (uint32_t)(distance_miles / MILES_PER_ROTATION);
+
+    // Convert hours to seconds
+    uint32_t seconds = (uint32_t)(hours * 3600.0f);
+
+    printf("[ODOMETER] Setting lifetime totals:\n");
+    printf("  - Hours: %.2f -> %lu seconds\n", hours, seconds);
+    printf("  - Distance: %.2f miles -> %lu rotations\n", distance_miles, rotations);
+    printf("  - Previous lifetime: %lu rotations, %lu seconds\n",
+           counts.lifetime_rotations, counts.lifetime_active_seconds);
+
+    // Update the lifetime totals
+    counts.lifetime_rotations = rotations;
+    counts.lifetime_active_seconds = seconds;
+
+    printf("  - New lifetime: %lu rotations, %lu seconds\n",
+           counts.lifetime_rotations, counts.lifetime_active_seconds);
+
+    // Save to flash immediately
+    printf("  - Saving to flash...\n");
+    odometer_save_count();
+    printf("  - Lifetime totals saved successfully\n");
+}
+
 // WiFi/NTP functions - to be implemented
 // Note: This is a stub. Full implementation requires:
 // 1. Initialize WiFi with cyw43_arch_init()

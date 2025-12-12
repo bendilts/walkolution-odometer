@@ -879,6 +879,42 @@ static int att_write_callback(hci_con_handle_t con_handle, uint16_t att_handle, 
         }
     }
 
+    // Set lifetime totals characteristic
+    if (att_handle == ATT_CHARACTERISTIC_12345678_1234_5678_1234_56789ABCDEF7_01_VALUE_HANDLE)
+    {
+        if (buffer_size == 8)
+        {
+            // Parse 8 bytes: 4 bytes hours (float) + 4 bytes distance (float)
+            float hours, distance;
+            memcpy(&hours, &buffer[0], 4);
+            memcpy(&distance, &buffer[4], 4);
+
+            printf("[BLE] Set lifetime totals received:\n");
+            printf("  - Hours: %.2f\n", hours);
+            printf("  - Distance: %.2f miles\n", distance);
+
+            // Get current metric setting to determine if we need to convert
+            const user_settings_t *settings = user_settings_get();
+            bool metric = settings->metric;
+
+            // If metric mode, convert km to miles for internal storage
+            float distance_miles = distance;
+            if (metric)
+            {
+                // Convert km to miles (1 km = 0.621371 miles)
+                distance_miles = distance * 0.621371f;
+                printf("  - Converted from %.2f km to %.2f miles\n", distance, distance_miles);
+            }
+
+            // Set the lifetime totals
+            odometer_set_lifetime_totals(hours, distance_miles);
+        }
+        else
+        {
+            printf("[BLE] ERROR: Invalid write size for set lifetime totals: %u bytes (expected 8)\n", buffer_size);
+        }
+    }
+
     return 0;
 }
 

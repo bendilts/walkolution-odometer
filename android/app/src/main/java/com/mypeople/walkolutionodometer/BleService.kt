@@ -149,6 +149,7 @@ class BleService : Service() {
         val TIME_SYNC_CHARACTERISTIC_UUID: UUID = UUID.fromString("12345678-1234-5678-1234-56789abcdef4")
         val USER_SETTINGS_CHARACTERISTIC_UUID: UUID = UUID.fromString("12345678-1234-5678-1234-56789abcdef5")
         val WIFI_VALIDATION_STATUS_CHARACTERISTIC_UUID: UUID = UUID.fromString("12345678-1234-5678-1234-56789abcdef6")
+        val SET_LIFETIME_TOTALS_CHARACTERISTIC_UUID: UUID = UUID.fromString("12345678-1234-5678-1234-56789abcdef7")
         val CLIENT_CHARACTERISTIC_CONFIG_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         const val CM_PER_ROTATION = 34.56f
@@ -1482,6 +1483,43 @@ class BleService : Service() {
             }
         } else {
             Log.w(TAG, "WiFi validation status characteristic not found")
+        }
+    }
+
+    // Set lifetime totals (hours and distance)
+    fun setLifetimeTotals(hours: Float, distance: Float) {
+        if (!hasBluetoothConnectPermission()) {
+            Log.w(TAG, "Cannot set lifetime totals - missing permission")
+            return
+        }
+
+        if (bluetoothGatt == null) {
+            Log.w(TAG, "Cannot set lifetime totals - not connected")
+            return
+        }
+
+        val service = bluetoothGatt?.getService(ODOMETER_SERVICE_UUID)
+        val characteristic = service?.getCharacteristic(SET_LIFETIME_TOTALS_CHARACTERISTIC_UUID)
+        if (characteristic != null) {
+            // Create 8-byte packet: 4 bytes hours (float) + 4 bytes distance (float)
+            val buffer = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
+            buffer.putFloat(hours)
+            buffer.putFloat(distance)
+            val data = buffer.array()
+
+            Log.d(TAG, "Setting lifetime totals: hours=$hours, distance=$distance")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                bluetoothGatt?.writeCharacteristic(characteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+            } else {
+                @Suppress("DEPRECATION")
+                characteristic.value = data
+                @Suppress("DEPRECATION")
+                characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                @Suppress("DEPRECATION")
+                bluetoothGatt?.writeCharacteristic(characteristic)
+            }
+        } else {
+            Log.w(TAG, "Set lifetime totals characteristic not found")
         }
     }
 }

@@ -93,4 +93,9 @@ uint32_t odometer_get_boot_active_time_seconds(void);
 // Reset the speed calculation window (called when boot rotations are reset)
 void odometer_reset_speed_window(void);
 
+// Set lifetime totals (for transferring progress to a new device)
+// hours: total hours of active time
+// distance_miles: total distance in miles
+void odometer_set_lifetime_totals(float hours, float distance_miles);
+
 #endif // ODOMETER_H

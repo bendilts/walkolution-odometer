@@ -18,6 +18,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.Box
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -30,8 +31,12 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -205,9 +210,6 @@ class MainActivity : ComponentActivity() {
         // Initialize session cache manager
         sessionCacheManager = SessionCacheManager(this)
 
-        // Check if returning from Strava OAuth
-        handleStravaCallback(intent)
-
         // Check existing auth status
         lifecycleScope.launch {
             stravaAuthenticated.value = stravaRepository.isAuthenticated()
@@ -216,26 +218,21 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             WalkolutionOdometerTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    OdometerScreen(
-                        connectionStatus = connectionStatus.value,
-                        odometerData = odometerData.value,
-                        unreportedSessions = unreportedSessions.value,
-                        onMarkReported = { sessionId -> markSessionReported(sessionId) },
-                        onDiscardSession = { sessionId -> discardSession(sessionId) },
-                        stravaAuthenticated = stravaAuthenticated.value,
-                        stravaAthleteName = stravaAthleteName.value,
-                        stravaStatus = stravaStatus.value,
-                        onConnectStrava = { connectToStrava() },
-                        onDisconnectStrava = { disconnectStrava() },
-                        onUploadToStrava = { session -> uploadToStrava(session) },
-                        onUploadCurrentSession = { uploadCurrentSessionToStrava() },
-                        uploadingSessions = uploadingSessions.value,
-                        isBleConnected = isConnected.value,
-                        onOpenSettings = { openSettings() },
-                        modifier = Modifier.padding(innerPadding)
-                    )
-                }
+                OdometerScreenWithTopBar(
+                    connectionStatus = connectionStatus.value,
+                    odometerData = odometerData.value,
+                    unreportedSessions = unreportedSessions.value,
+                    onMarkReported = { sessionId -> markSessionReported(sessionId) },
+                    onDiscardSession = { sessionId -> discardSession(sessionId) },
+                    stravaAuthenticated = stravaAuthenticated.value,
+                    onUploadToStrava = { session -> uploadToStrava(session) },
+                    onUploadCurrentSession = { uploadCurrentSessionToStrava() },
+                    uploadingSessions = uploadingSessions.value,
+                    isBleConnected = isConnected.value,
+                    onOpenSettings = { openSettings() },
+                    onOpenSetLifetimeTotals = { openSetLifetimeTotals() },
+                    onOpenStravaSettings = { openStravaSettings() }
+                )
             }
         }
 
@@ -260,11 +257,6 @@ class MainActivity : ComponentActivity() {
             unbindService(serviceConnection)
             serviceBound = false
         }
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        handleStravaCallback(intent)
     }
 
     private fun checkPermissionsAndStartService() {
@@ -306,36 +298,6 @@ class MainActivity : ComponentActivity() {
 
         // Bind to service
         bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
-    }
-
-    private fun handleStravaCallback(intent: Intent?) {
-        val uri = intent?.data ?: return
-        if (uri.scheme == "walkolution" && uri.host == "walkolution") {
-            val code = uri.getQueryParameter("code")
-            val error = uri.getQueryParameter("error")
-
-            if (code != null) {
-                lifecycleScope.launch {
-                    stravaStatus.value = "Connecting to Strava..."
-                    val result = stravaRepository.exchangeCodeForTokens(code)
-                    if (result.isSuccess) {
-                        stravaAuthenticated.value = true
-                        stravaAthleteName.value = stravaRepository.getAthleteName()
-                        stravaStatus.value = "Connected to Strava!"
-                    } else {
-                        stravaStatus.value = "Failed: ${result.exceptionOrNull()?.message}"
-                    }
-                }
-            } else if (error != null) {
-                stravaStatus.value = "Authorization denied"
-            }
-        }
-    }
-
-    private fun connectToStrava() {
-        val authUrl = stravaRepository.getAuthorizationUrl()
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(authUrl))
-        startActivity(intent)
     }
 
     private fun uploadToStrava(session: SessionRecord) {
@@ -440,15 +402,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun disconnectStrava() {
-        lifecycleScope.launch {
-            stravaRepository.logout()
-            stravaAuthenticated.value = false
-            stravaAthleteName.value = null
-            stravaStatus.value = null
-        }
-    }
-
     private fun markSessionReported(sessionId: Int) {
         bleService?.markSessionReported(sessionId)
     }
@@ -473,6 +426,101 @@ class MainActivity : ComponentActivity() {
         val intent = Intent(this, SettingsActivity::class.java)
         startActivity(intent)
     }
+
+    private fun openSetLifetimeTotals() {
+        val intent = Intent(this, SetLifetimeTotalsActivity::class.java)
+        startActivity(intent)
+    }
+
+    private fun openStravaSettings() {
+        val intent = Intent(this, StravaSettingsActivity::class.java)
+        startActivity(intent)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun OdometerScreenWithTopBar(
+    connectionStatus: String,
+    odometerData: OdometerData,
+    unreportedSessions: List<SessionRecord>,
+    onMarkReported: (Int) -> Unit,
+    onDiscardSession: (Int) -> Unit,
+    stravaAuthenticated: Boolean,
+    onUploadToStrava: (SessionRecord) -> Unit,
+    onUploadCurrentSession: () -> Unit,
+    uploadingSessions: Set<Int>,
+    isBleConnected: Boolean,
+    onOpenSettings: () -> Unit,
+    onOpenSetLifetimeTotals: () -> Unit,
+    onOpenStravaSettings: () -> Unit
+) {
+    var showMenu by remember { mutableStateOf(false) }
+
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text(
+                        text = "Walkolution Odometer",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                },
+                actions = {
+                    Box {
+                        IconButton(onClick = { showMenu = true }) {
+                            Icon(
+                                imageVector = Icons.Default.MoreVert,
+                                contentDescription = "More options"
+                            )
+                        }
+                        DropdownMenu(
+                            expanded = showMenu,
+                            onDismissRequest = { showMenu = false }
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Settings") },
+                                onClick = {
+                                    showMenu = false
+                                    onOpenSettings()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Strava Settings") },
+                                onClick = {
+                                    showMenu = false
+                                    onOpenStravaSettings()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Set Lifetime Totals") },
+                                onClick = {
+                                    showMenu = false
+                                    onOpenSetLifetimeTotals()
+                                }
+                            )
+                        }
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        OdometerScreen(
+            connectionStatus = connectionStatus,
+            odometerData = odometerData,
+            unreportedSessions = unreportedSessions,
+            onMarkReported = onMarkReported,
+            onDiscardSession = onDiscardSession,
+            stravaAuthenticated = stravaAuthenticated,
+            onUploadToStrava = onUploadToStrava,
+            onUploadCurrentSession = onUploadCurrentSession,
+            uploadingSessions = uploadingSessions,
+            isBleConnected = isBleConnected,
+            modifier = Modifier.padding(innerPadding)
+        )
+    }
 }
 
 @Composable
@@ -483,15 +531,10 @@ fun OdometerScreen(
     onMarkReported: (Int) -> Unit,
     onDiscardSession: (Int) -> Unit,
     stravaAuthenticated: Boolean,
-    stravaAthleteName: String?,
-    stravaStatus: String?,
-    onConnectStrava: () -> Unit,
-    onDisconnectStrava: () -> Unit,
     onUploadToStrava: (SessionRecord) -> Unit,
     onUploadCurrentSession: () -> Unit,
     uploadingSessions: Set<Int>,
     isBleConnected: Boolean,
-    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     var sessionToConfirmDelete by remember { mutableStateOf<SessionRecord?>(null) }
@@ -529,31 +572,11 @@ fun OdometerScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Top
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 16.dp, bottom = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "Walkolution Odometer",
-                fontSize = 28.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.weight(1f)
-            )
-            IconButton(onClick = onOpenSettings) {
-                Icon(
-                    imageVector = Icons.Default.Settings,
-                    contentDescription = "Settings"
-                )
-            }
-        }
         Text(
             text = connectionStatus,
             fontSize = 14.sp,
             color = if (connectionStatus == "Connected") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-            modifier = Modifier.padding(bottom = 24.dp)
+            modifier = Modifier.padding(top = 8.dp, bottom = 16.dp)
         )
 
         Divider(modifier = Modifier.padding(vertical = 8.dp))
@@ -686,46 +709,6 @@ fun OdometerScreen(
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Medium,
                     color = MaterialTheme.colorScheme.secondary
-                )
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-            Divider(modifier = Modifier.padding(vertical = 8.dp))
-
-            Text(
-                text = "Strava",
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(bottom = 12.dp, top = 8.dp)
-            )
-
-            if (stravaAuthenticated) {
-                Text(
-                    text = "Connected as: ${stravaAthleteName ?: "Unknown"}",
-                    fontSize = 14.sp,
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
-
-                OutlinedButton(
-                    onClick = onDisconnectStrava,
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = MaterialTheme.colorScheme.error
-                    )
-                ) {
-                    Text("Disconnect from Strava")
-                }
-            } else {
-                Button(onClick = onConnectStrava) {
-                    Text("Connect to Strava")
-                }
-            }
-
-            stravaStatus?.let { status ->
-                Text(
-                    text = status,
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.secondary,
-                    modifier = Modifier.padding(top = 8.dp)
                 )
             }
 
