@@ -432,3 +432,11 @@ void oled_draw_bitmap(int x, int y, const uint8_t *bitmap, int width, int height
 
     mutex_exit(&buffer_mutex);
 }
+
+void oled_display_on(void) {
+    oled_send_cmd(0xAF); // Display on
+}
+
+void oled_display_off(void) {
+    oled_send_cmd(0xAE); // Display off (sleep mode)
+}

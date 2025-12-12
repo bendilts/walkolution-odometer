@@ -77,6 +77,7 @@
 #endif
 
 #define BACKLIGHT_VOLTAGE_THRESHOLD_MV 3000 // 3.0V minimum for backlight
+#define OLED_VOLTAGE_THRESHOLD_MV 3000      // 3.0V minimum for OLED (turn off below this)
 #define BLE_VOLTAGE_THRESHOLD_MV 4200       // 4.2V minimum for Bluetooth
 #define BLE_UPDATE_INTERVAL_MS 1000         // Send data to phone every second
 #define SPEED_WINDOW_SECONDS 5              // 5-second running average for speed
@@ -1316,6 +1317,7 @@ int main()
     uint32_t last_display_switch_ms = to_ms_since_boot(get_absolute_time());
     uint32_t last_update_ms = 0;
     uint32_t last_voltage_check_ms = 0;
+    bool oled_is_on = true; // Track OLED power state
 
     // BLE data update tracking
     uint32_t last_ble_update_ms = 0;
@@ -1358,13 +1360,38 @@ int main()
         bool sensor_state = gpio_get(SENSOR_PIN);
         pico_set_led(sensor_state);
 
-        // Check voltage periodically and control BLE
+        // Check voltage periodically and control BLE and OLED
         if ((current_time_ms - last_voltage_check_ms) >= VOLTAGE_CHECK_INTERVAL_MS)
         {
             uint16_t voltage_mv = odometer_read_voltage();
 
-            printf("[%lu] Voltage check: %u mV, ble_advertising=%d, ble_connected=%d\n",
-                   current_time_ms, voltage_mv, ble_advertising, ble_connected);
+            printf("[%lu] Voltage check: %u mV, ble_advertising=%d, ble_connected=%d, oled_is_on=%d\n",
+                   current_time_ms, voltage_mv, ble_advertising, ble_connected, oled_is_on);
+
+            // Control OLED power based on voltage threshold (3.0V)
+            if (voltage_mv < OLED_VOLTAGE_THRESHOLD_MV && oled_is_on)
+            {
+                printf("*** TURNING OFF OLED (voltage %u < %u) ***\n",
+                       voltage_mv, OLED_VOLTAGE_THRESHOLD_MV);
+                oled_display_off();
+                oled_is_on = false;
+            }
+            else if (voltage_mv >= OLED_VOLTAGE_THRESHOLD_MV && !oled_is_on)
+            {
+                printf("*** TURNING ON OLED (voltage %u >= %u) ***\n",
+                       voltage_mv, OLED_VOLTAGE_THRESHOLD_MV);
+                oled_display_on();
+                oled_is_on = true;
+                // Force a display update to refresh the screen
+                if (showing_session)
+                {
+                    update_oled_session(wifi_connected, ble_connected, ble_advertising);
+                }
+                else
+                {
+                    update_oled_totals(wifi_connected, ble_connected, ble_advertising);
+                }
+            }
 
             // Start BLE advertising based on voltage (only check for starting, never stop once started)
             if (voltage_mv >= BLE_VOLTAGE_THRESHOLD_MV && !ble_advertising)
@@ -1431,8 +1458,8 @@ int main()
             last_ble_update_ms = current_time_ms;
         }
 
-        // Switch display mode every 5 seconds
-        if ((current_time_ms - last_display_switch_ms) >= DISPLAY_SWITCH_INTERVAL_MS)
+        // Switch display mode every 5 seconds (only if OLED is on)
+        if (oled_is_on && (current_time_ms - last_display_switch_ms) >= DISPLAY_SWITCH_INTERVAL_MS)
         {
             showing_session = !showing_session;
             last_display_switch_ms = current_time_ms;
@@ -1449,24 +1476,28 @@ int main()
         }
         // Update display frequently when advertising (250ms for smooth flashing animation)
         // Otherwise update every 500ms for smooth time updates
-        uint32_t update_interval = (ble_advertising && !ble_connected) ? 250 : OLED_UPDATE_INTERVAL_MS;
+        // Skip all updates if OLED is off to conserve power
+        else if (oled_is_on)
+        {
+            uint32_t update_interval = (ble_advertising && !ble_connected) ? 250 : OLED_UPDATE_INTERVAL_MS;
 
-        if (showing_session && (current_time_ms - last_update_ms) >= update_interval)
-        {
-            update_oled_session(wifi_connected, ble_connected, ble_advertising);
-            last_update_ms = current_time_ms;
-        }
-        // Also update totals screen when advertising for flashing animation
-        else if (!showing_session && ble_advertising && !ble_connected && (current_time_ms - last_update_ms) >= 250)
-        {
-            update_oled_totals(wifi_connected, ble_connected, ble_advertising);
-            last_update_ms = current_time_ms;
-        }
-        // Update session display on rotation when showing session
-        else if (showing_session && rotation_detected)
-        {
-            update_oled_session(wifi_connected, ble_connected, ble_advertising);
-            last_update_ms = to_ms_since_boot(get_absolute_time());
+            if (showing_session && (current_time_ms - last_update_ms) >= update_interval)
+            {
+                update_oled_session(wifi_connected, ble_connected, ble_advertising);
+                last_update_ms = current_time_ms;
+            }
+            // Also update totals screen when advertising for flashing animation
+            else if (!showing_session && ble_advertising && !ble_connected && (current_time_ms - last_update_ms) >= 250)
+            {
+                update_oled_totals(wifi_connected, ble_connected, ble_advertising);
+                last_update_ms = current_time_ms;
+            }
+            // Update session display on rotation when showing session
+            else if (showing_session && rotation_detected)
+            {
+                update_oled_session(wifi_connected, ble_connected, ble_advertising);
+                last_update_ms = to_ms_since_boot(get_absolute_time());
+            }
         }
 
         sleep_ms(POLL_DELAY_MS);

@@ -10,6 +10,7 @@ cmake-build-*/
 *.map
 *.dis
 *.elf.map
+prusa_mini_bed_oscillate_10h.gcode
 
 # CMake
 CMakeCache.txt

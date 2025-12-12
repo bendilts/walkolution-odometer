@@ -65,4 +65,10 @@ void oled_update(void);
 // Wait for any pending update to complete (optional, for synchronization)
 void oled_wait_for_update(void);
 
+// Turn OLED display on (wake from sleep)
+void oled_display_on(void);
+
+// Turn OLED display off (sleep mode, saves power)
+void oled_display_off(void);
+
 #endif // OLED_H
