@@ -17,8 +17,9 @@ void odometer_init(uint8_t sensor_pin);
 // Set LED callback for visual feedback
 void odometer_set_led_callback(led_callback_t callback);
 
-// Process sensor readings (call every 10ms)
+// Process sensor readings (simple edge detection, no debouncing)
 // Returns true if a new rotation was detected
+// Call at polling rate appropriate for your max speed (e.g., 30ms for 8mph)
 bool odometer_process(void);
 
 // Get the total number of rotations (all-time)

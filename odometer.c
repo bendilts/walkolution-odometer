@@ -11,9 +11,6 @@
 #include <string.h>
 #include <stdio.h>
 
-#define HIGH_THRESHOLD_MS 6
-#define LOW_THRESHOLD_MS 6
-#define POLL_INTERVAL_MS 2
 #define SLEEP_TIMEOUT_MS 10000
 #define ACTIVE_TIMEOUT_MS 3000       // Stop counting active time after 3 seconds of no rotations
 #define FLASH_SAVE_INTERVAL_MS 60000 // Don't save more than once per minute
@@ -24,18 +21,6 @@
 #define FLASH_SECTOR_COUNT 64
 #define FLASH_START_OFFSET (PICO_FLASH_SIZE_BYTES - (FLASH_SECTOR_SIZE * FLASH_SECTOR_COUNT))
 #define FLASH_MAGIC_NUMBER 0x4F444F53 // "ODOS" in hex (Odometer Session)
-
-// Calculate how many consecutive readings needed
-#define HIGH_COUNT_THRESHOLD (HIGH_THRESHOLD_MS / POLL_INTERVAL_MS)
-#define LOW_COUNT_THRESHOLD (LOW_THRESHOLD_MS / POLL_INTERVAL_MS)
-
-typedef enum
-{
-    STATE_WAITING_HIGH,
-    STATE_CONFIRMING_HIGH,
-    STATE_WAITING_LOW,
-    STATE_CONFIRMING_LOW
-} odometer_state_t;
 
 // Flash storage structure - session-based
 typedef struct
@@ -91,9 +76,6 @@ typedef struct
 typedef struct
 {
     uint8_t sensor_pin;
-    odometer_state_t state;
-    uint8_t consecutive_count;
-    uint32_t last_change_time_ms;
     bool last_sensor_state;
 } sensor_state_t;
 
@@ -114,7 +96,7 @@ typedef struct
 static odometer_counts_t counts = {0};
 static session_state_t session = {0};
 static previous_session_t prev_session = {0};
-static sensor_state_t sensor = {.state = STATE_WAITING_HIGH};
+static sensor_state_t sensor = {0};
 static callbacks_t callbacks = {0};
 static save_state_t save_state = {0};
 
@@ -452,9 +434,6 @@ void odometer_init(uint8_t pin)
     gpio_init(sensor.sensor_pin);
     gpio_set_dir(sensor.sensor_pin, GPIO_IN);
     gpio_pull_up(sensor.sensor_pin); // Enable internal pull-up resistor
-    sensor.state = STATE_WAITING_HIGH;
-    sensor.consecutive_count = 0;
-    sensor.last_change_time_ms = to_ms_since_boot(get_absolute_time());
     sensor.last_sensor_state = gpio_get(sensor.sensor_pin);
 
     // Initialize ADC for voltage monitoring
@@ -517,89 +496,40 @@ bool odometer_process(void)
         }
     }
 
-    // Check if sensor state has changed
+    // Simple edge detection - detect state changes from the latching Hall Effect sensor
+    // Each edge represents a half-rotation (sensor toggles on each magnet pass)
     if (sensor_high != sensor.last_sensor_state)
     {
         sensor.last_sensor_state = sensor_high;
-        sensor.last_change_time_ms = current_time_ms;
-    }
 
-    switch (sensor.state)
-    {
-    case STATE_WAITING_HIGH:
-        if (sensor_high)
-        {
-            sensor.state = STATE_CONFIRMING_HIGH;
-            sensor.consecutive_count = 1;
-        }
-        break;
-
-    case STATE_CONFIRMING_HIGH:
-        if (sensor_high)
-        {
-            sensor.consecutive_count++;
-            if (sensor.consecutive_count >= HIGH_COUNT_THRESHOLD)
-            {
-                sensor.state = STATE_WAITING_LOW;
-                sensor.consecutive_count = 0;
-            }
-        }
-        else
-        {
-            // Noise, go back to waiting
-            sensor.state = STATE_WAITING_HIGH;
-            sensor.consecutive_count = 0;
-        }
-        break;
-
-    case STATE_WAITING_LOW:
+        // Every edge is a half-rotation, so count every 2 edges as 1 full rotation
+        // We'll count on falling edges (sensor goes LOW)
         if (!sensor_high)
         {
-            sensor.state = STATE_CONFIRMING_LOW;
-            sensor.consecutive_count = 1;
-        }
-        break;
+            // Complete rotation detected!
+            counts.lifetime_rotations++;
+            counts.session_rotations++;
+            counts.boot_rotations++;
+            rotation_detected = true;
 
-    case STATE_CONFIRMING_LOW:
-        if (!sensor_high)
-        {
-            sensor.consecutive_count++;
-            if (sensor.consecutive_count >= LOW_COUNT_THRESHOLD)
+            // Update active time tracking
+            counts.last_rotation_time_ms = current_time_ms;
+            if (!counts.is_active)
             {
-                // Complete rotation detected!
-                counts.lifetime_rotations++;
-                counts.session_rotations++;
-                counts.boot_rotations++;
-                rotation_detected = true;
-                sensor.state = STATE_WAITING_HIGH;
-                sensor.consecutive_count = 0;
+                // Starting a new active period
+                counts.active_start_time_ms = current_time_ms;
+                counts.is_active = true;
+            }
 
-                // Update active time tracking
-                counts.last_rotation_time_ms = current_time_ms;
-                if (!counts.is_active)
-                {
-                    // Starting a new active period
-                    counts.active_start_time_ms = current_time_ms;
-                    counts.is_active = true;
-                }
-
-                // Check if we should save to flash based on rotation count
-                // Save every ROTATION_SAVE_INTERVAL rotations (2500 = ~0.5 miles)
-                // Only save if time is synced (or timeout reached) to ensure accurate merge decisions
-                if (can_save_to_flash() &&
-                    (counts.lifetime_rotations - save_state.last_saved_count) >= ROTATION_SAVE_INTERVAL)
-                {
-                    odometer_save_count();
-                }
+            // Check if we should save to flash based on rotation count
+            // Save every ROTATION_SAVE_INTERVAL rotations (2500 = ~0.5 miles)
+            // Only save if time is synced (or timeout reached) to ensure accurate merge decisions
+            if (can_save_to_flash() &&
+                (counts.lifetime_rotations - save_state.last_saved_count) >= ROTATION_SAVE_INTERVAL)
+            {
+                odometer_save_count();
             }
         }
-        else
-        {
-            // Noise, go back to waiting for low
-            sensor.state = STATE_WAITING_LOW;
-            sensor.consecutive_count = 0;
-        }
-        break;
     }
 
     return rotation_detected;

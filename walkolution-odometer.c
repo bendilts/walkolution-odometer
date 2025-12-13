@@ -38,7 +38,11 @@
 #endif
 
 #ifndef POLL_DELAY_MS
-#define POLL_DELAY_MS 10
+// Polling interval calculated for 8 mph with 3 polls per revolution:
+// - 8 mph = 37,260 rotations/hour = 10.35 rot/sec = 96.6 ms/rotation
+// - 3 polls per rotation = 96.6 ms / 3 = 32.2 ms
+// - Using 30 ms for safety margin (~3.2 polls per rotation at 8 mph)
+#define POLL_DELAY_MS 30
 #endif
 
 // Debug mode: simulate rotations at ~2 MPH
