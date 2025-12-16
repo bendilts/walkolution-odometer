@@ -59,10 +59,6 @@
 #define DEBUG_ROTATION_INTERVAL_MS 1000 /* 387 */
 #endif
 
-#ifndef LED_FLASH_MS
-#define LED_FLASH_MS 50
-#endif
-
 #ifndef OLED_UPDATE_INTERVAL_MS
 #define OLED_UPDATE_INTERVAL_MS 1000 // 1 second update rate for power savings
 #endif
@@ -81,12 +77,10 @@
 #define VOLTAGE_CHECK_INTERVAL_MS 1000
 #endif
 
-#define BACKLIGHT_VOLTAGE_THRESHOLD_MV 3000 // 3.0V minimum for backlight
 #define OLED_VOLTAGE_THRESHOLD_MV 3000      // 3.0V minimum for OLED (turn off below this)
 #define BLE_VOLTAGE_THRESHOLD_MV 4200       // 4.2V minimum for Bluetooth
 #define BLE_UPDATE_INTERVAL_MS 1000         // Send data to phone every second
 #define SPEED_WINDOW_SECONDS 5              // 5-second running average for speed
-#define CONNECTION_STATUS_ANIMATION_MS 150  // Update connection status animation every 250ms
 
 // Perform initialisation
 int pico_led_init(void)
@@ -1252,7 +1246,6 @@ static void poll_wifi_ntp(void)
 int main()
 {
     stdio_init_all();
-    sleep_ms(2000); // Give USB serial time to connect
 
     // Underclock to 68 MHz for power savings (default is 125 MHz)
     // Going lower than 68 MHz may cause issues with USB/BLE/I2C peripherals
