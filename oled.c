@@ -110,8 +110,8 @@ void oled_init(void* i2c_inst, uint8_t sda_pin, uint8_t scl_pin, uint8_t addr) {
     i2c_port = (i2c_inst_t*)i2c_inst;
     oled_addr = addr;
 
-    // Initialize I2C at 1MHz (faster than standard 400kHz)
-    i2c_init(i2c_port, 1000 * 1000);
+    // Initialize I2C at 400kHz (standard speed, lower power than 1MHz)
+    i2c_init(i2c_port, 400 * 1000);
     gpio_set_function(sda_pin, GPIO_FUNC_I2C);
     gpio_set_function(scl_pin, GPIO_FUNC_I2C);
     gpio_set_pulls(sda_pin, true, false);

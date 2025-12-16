@@ -6,6 +6,7 @@
 
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
+#include "hardware/clocks.h"
 #include "odometer.h"
 #include "oled.h"
 #include "font.h"
@@ -63,7 +64,7 @@
 #endif
 
 #ifndef OLED_UPDATE_INTERVAL_MS
-#define OLED_UPDATE_INTERVAL_MS 500
+#define OLED_UPDATE_INTERVAL_MS 1000 // 1 second update rate for power savings
 #endif
 
 #ifndef DISPLAY_SWITCH_INTERVAL_MS
@@ -1252,7 +1253,13 @@ int main()
 {
     stdio_init_all();
     sleep_ms(2000); // Give USB serial time to connect
+
+    // Underclock to 68 MHz for power savings (default is 125 MHz)
+    // Going lower than 68 MHz may cause issues with USB/BLE/I2C peripherals
     printf("\n\n=== WALKOLUTION ODOMETER STARTING ===\n");
+    printf("Underclocking system from 125 MHz to 68 MHz...\n");
+    set_sys_clock_khz(68000, true); // 68 MHz = 68000 kHz, true = required
+    printf("System clock: %lu Hz (%.1f MHz)\n", clock_get_hz(clk_sys), clock_get_hz(clk_sys) / 1000000.0f);
 
     int rc = pico_led_init();
     hard_assert(rc == PICO_OK);
@@ -1479,7 +1486,7 @@ int main()
             last_update_ms = current_time_ms;
         }
         // Update display frequently when advertising (250ms for smooth flashing animation)
-        // Otherwise update every 500ms for smooth time updates
+        // Otherwise update every 1 second for power savings (clock still updates smoothly)
         // Skip all updates if OLED is off to conserve power
         else if (oled_is_on)
         {
