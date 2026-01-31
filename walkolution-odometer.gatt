@@ -29,16 +29,16 @@ CHARACTERISTIC, 12345678-1234-5678-1234-56789ABCDEF4, WRITE | DYNAMIC,
 
 // User Settings Characteristic
 // Characteristic UUID: 12345678-1234-5678-1234-56789ABCDEF5
-// READ: Returns current settings (193 bytes: 1 byte metric + 64 bytes SSID + 128 bytes password)
-// WRITE: Updates settings and triggers WiFi validation
+// READ: Returns current settings (1 byte: metric only)
+// WRITE: Updates settings
 CHARACTERISTIC, 12345678-1234-5678-1234-56789ABCDEF5, READ | WRITE | DYNAMIC,
-
-// WiFi Validation Status Characteristic
-// Characteristic UUID: 12345678-1234-5678-1234-56789ABCDEF6
-// READ/NOTIFY: 1 byte status (0=idle, 1=testing, 2=success, 3=failed)
-CHARACTERISTIC, 12345678-1234-5678-1234-56789ABCDEF6, READ | NOTIFY | DYNAMIC,
 
 // Set Lifetime Totals Characteristic
 // Characteristic UUID: 12345678-1234-5678-1234-56789ABCDEF7
 // WRITE: 8 bytes (4 bytes hours as float + 4 bytes distance as float)
 CHARACTERISTIC, 12345678-1234-5678-1234-56789ABCDEF7, WRITE | DYNAMIC,
+
+// Logs Characteristic
+// Characteristic UUID: 12345678-1234-5678-1234-56789ABCDEF8
+// READ: Returns new log data since last read (variable length, up to MTU size)
+CHARACTERISTIC, 12345678-1234-5678-1234-56789ABCDEF8, READ | DYNAMIC,

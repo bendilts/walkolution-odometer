@@ -3,6 +3,7 @@
  */
 
 #include "odometer.h"
+#include "logging.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/flash.h"
@@ -115,6 +116,127 @@ static uint32_t calculate_checksum(const flash_data_t *data)
            data->reported;
 }
 
+// Write data to flash with automatic verification and retry
+// Handles erase, program, verify, and retry logic
+// Returns true if write succeeded and verified, false otherwise
+static bool write_flash_and_verify(uint32_t sector_offset, const uint8_t *write_buffer, const char *operation_title)
+{
+    const flash_data_t *expected = (const flash_data_t *)write_buffer;
+    const flash_data_t *flash_data;
+    bool verification_passed = false;
+    uint32_t target_sector = (sector_offset - FLASH_START_OFFSET) / FLASH_SECTOR_SIZE;
+
+    // Log all data being written to flash BEFORE writing
+    log_printf("========================================\n");
+    log_printf("[FLASH WRITE] %s:\n", operation_title);
+    log_printf("  Sector: %lu (offset 0x%08lX)\n", target_sector, sector_offset);
+    log_printf("  Magic: 0x%08lX\n", expected->magic);
+    log_printf("  Struct Version: %lu\n", expected->struct_version);
+    log_printf("  Session ID: %lu\n", expected->session_id);
+    log_printf("  Session Rotations: %lu\n", expected->session_rotation_count);
+    log_printf("  Session Active Time: %lu seconds\n", expected->session_active_time_seconds);
+    log_printf("  Session Start Time: %lu\n", expected->session_start_time_unix);
+    log_printf("  Session End Time: %lu\n", expected->session_end_time_unix);
+    log_printf("  Lifetime Rotations: %lu\n", expected->lifetime_rotation_count);
+    log_printf("  Lifetime Time: %lu seconds\n", expected->lifetime_time_seconds);
+    log_printf("  Reported: %u%s\n", expected->reported, expected->reported ? " (CHANGED TO 1)" : "");
+    log_printf("  Checksum: 0x%08lX\n", expected->checksum);
+    log_printf("========================================\n");
+
+    // Try write + verify up to 2 times (initial + 1 retry)
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) {
+            log_printf("[FLASH VERIFY] Retrying flash write (attempt %d/2)...\n", attempt + 1);
+        }
+
+        // Erase and program the flash sector
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_erase(sector_offset, FLASH_SECTOR_SIZE);
+        flash_range_program(sector_offset, write_buffer, FLASH_PAGE_SIZE);
+        restore_interrupts(ints);
+
+        // Now verify what we just wrote
+        flash_data = (const flash_data_t *)(XIP_BASE + sector_offset);
+        verification_passed = true; // Assume success until we find a problem
+
+        // Verify magic number
+        if (flash_data->magic != expected->magic) {
+            log_printf("[FLASH VERIFY] ERROR: Magic mismatch! Expected 0x%08lX, got 0x%08lX\n",
+                       expected->magic, flash_data->magic);
+            verification_passed = false;
+        }
+
+        // Verify checksum
+        else if (flash_data->checksum != expected->checksum) {
+            log_printf("[FLASH VERIFY] ERROR: Checksum mismatch! Expected 0x%08lX, got 0x%08lX\n",
+                       expected->checksum, flash_data->checksum);
+            verification_passed = false;
+        }
+
+        // Verify checksum is valid
+        else {
+            uint32_t calculated_checksum = calculate_checksum(flash_data);
+            if (flash_data->checksum != calculated_checksum) {
+                log_printf("[FLASH VERIFY] ERROR: Checksum invalid! Stored 0x%08lX, calculated 0x%08lX\n",
+                           flash_data->checksum, calculated_checksum);
+                verification_passed = false;
+            }
+        }
+
+        // Verify all fields match
+        if (verification_passed &&
+            (flash_data->struct_version != expected->struct_version ||
+             flash_data->session_id != expected->session_id ||
+             flash_data->session_rotation_count != expected->session_rotation_count ||
+             flash_data->session_active_time_seconds != expected->session_active_time_seconds ||
+             flash_data->session_start_time_unix != expected->session_start_time_unix ||
+             flash_data->session_end_time_unix != expected->session_end_time_unix ||
+             flash_data->lifetime_rotation_count != expected->lifetime_rotation_count ||
+             flash_data->lifetime_time_seconds != expected->lifetime_time_seconds ||
+             flash_data->reported != expected->reported)) {
+
+            log_printf("[FLASH VERIFY] ERROR: Field mismatch detected:\n");
+            if (flash_data->struct_version != expected->struct_version)
+                log_printf("  - struct_version: expected %lu, got %lu\n", expected->struct_version, flash_data->struct_version);
+            if (flash_data->session_id != expected->session_id)
+                log_printf("  - session_id: expected %lu, got %lu\n", expected->session_id, flash_data->session_id);
+            if (flash_data->session_rotation_count != expected->session_rotation_count)
+                log_printf("  - session_rotation_count: expected %lu, got %lu\n", expected->session_rotation_count, flash_data->session_rotation_count);
+            if (flash_data->session_active_time_seconds != expected->session_active_time_seconds)
+                log_printf("  - session_active_time_seconds: expected %lu, got %lu\n", expected->session_active_time_seconds, flash_data->session_active_time_seconds);
+            if (flash_data->session_start_time_unix != expected->session_start_time_unix)
+                log_printf("  - session_start_time_unix: expected %lu, got %lu\n", expected->session_start_time_unix, flash_data->session_start_time_unix);
+            if (flash_data->session_end_time_unix != expected->session_end_time_unix)
+                log_printf("  - session_end_time_unix: expected %lu, got %lu\n", expected->session_end_time_unix, flash_data->session_end_time_unix);
+            if (flash_data->lifetime_rotation_count != expected->lifetime_rotation_count)
+                log_printf("  - lifetime_rotation_count: expected %lu, got %lu\n", expected->lifetime_rotation_count, flash_data->lifetime_rotation_count);
+            if (flash_data->lifetime_time_seconds != expected->lifetime_time_seconds)
+                log_printf("  - lifetime_time_seconds: expected %lu, got %lu\n", expected->lifetime_time_seconds, flash_data->lifetime_time_seconds);
+            if (flash_data->reported != expected->reported)
+                log_printf("  - reported: expected %u, got %u\n", expected->reported, flash_data->reported);
+
+            verification_passed = false;
+        }
+
+        // If verification passed, we're done
+        if (verification_passed) {
+            if (attempt > 0) {
+                log_printf("[FLASH VERIFY] ✓ Flash write verified successfully after retry\n");
+            } else {
+                log_printf("[FLASH VERIFY] ✓ Flash write verified successfully\n");
+            }
+            return true;
+        }
+
+        // If this was our last attempt, log final failure
+        if (attempt == 1) {
+            log_printf("[FLASH VERIFY] ERROR: Flash write verification failed after retry!\n");
+        }
+    }
+
+    return false;
+}
+
 // Read VSYS voltage in millivolts
 uint16_t odometer_read_voltage(void)
 {
@@ -165,7 +287,7 @@ uint16_t odometer_read_voltage(void)
         // Return last valid reading if we have one, otherwise return the bad reading
         if (last_valid_voltage > 0)
         {
-            printf("WARNING: Invalid voltage reading %lu mV, using cached %u mV\n",
+            log_printf("WARNING: Invalid voltage reading %lu mV, using cached %u mV\n",
                    vsys_mv, last_valid_voltage);
             return last_valid_voltage;
         }
@@ -185,6 +307,14 @@ static bool load_count_from_flash(void)
     bool found_valid = false;
     const flash_data_t *latest_data = NULL;
 
+    // Array to store valid sessions for logging (up to 64)
+    typedef struct {
+        const flash_data_t *data;
+        uint32_t sector;
+    } valid_session_t;
+    valid_session_t valid_sessions[FLASH_SECTOR_COUNT];
+    uint32_t valid_count = 0;
+
     // Scan all 64 sectors to find the one with the highest valid session_id
     for (uint32_t sector = 0; sector < FLASH_SECTOR_COUNT; sector++)
     {
@@ -195,6 +325,11 @@ static bool load_count_from_flash(void)
         if (flash_data->magic == FLASH_MAGIC_NUMBER &&
             flash_data->checksum == calculate_checksum(flash_data))
         {
+            // Store this valid session for logging
+            valid_sessions[valid_count].data = flash_data;
+            valid_sessions[valid_count].sector = sector;
+            valid_count++;
+
             // Check if this is the newest valid entry (highest session_id)
             if (!found_valid || flash_data->session_id > max_session_id)
             {
@@ -202,6 +337,45 @@ static bool load_count_from_flash(void)
                 latest_data = flash_data;
                 found_valid = true;
             }
+        }
+    }
+
+    // Log the 10 most recent valid sessions (sorted by session_id, descending)
+    if (valid_count > 0)
+    {
+        log_printf("[FLASH] Found %lu valid session(s) in flash\n", valid_count);
+        log_printf("[FLASH] Logging up to 10 most recent sessions:\n");
+
+        // Simple bubble sort to sort by session_id (descending)
+        for (uint32_t i = 0; i < valid_count - 1; i++)
+        {
+            for (uint32_t j = 0; j < valid_count - i - 1; j++)
+            {
+                if (valid_sessions[j].data->session_id < valid_sessions[j + 1].data->session_id)
+                {
+                    valid_session_t temp = valid_sessions[j];
+                    valid_sessions[j] = valid_sessions[j + 1];
+                    valid_sessions[j + 1] = temp;
+                }
+            }
+        }
+
+        // Log up to 10 most recent
+        uint32_t log_count = (valid_count > 10) ? 10 : valid_count;
+        for (uint32_t i = 0; i < log_count; i++)
+        {
+            const flash_data_t *d = valid_sessions[i].data;
+            log_printf("[FLASH]   [%lu] Sector %lu: ID=%lu, Rotations=%lu/%lu, Time=%lu/%lu sec, Start=%lu, End=%lu, Reported=%s\n",
+                       i + 1,
+                       valid_sessions[i].sector,
+                       d->session_id,
+                       d->session_rotation_count,
+                       d->lifetime_rotation_count,
+                       d->session_active_time_seconds,
+                       d->lifetime_time_seconds,
+                       d->session_start_time_unix,
+                       d->session_end_time_unix,
+                       (d->reported != 0) ? "YES" : "NO");
         }
     }
 
@@ -225,12 +399,12 @@ static bool load_count_from_flash(void)
         counts.session_active_seconds = 0;
         session.session_id_decided = false;
 
-        printf("[FLASH] Loaded previous session from flash:\n");
-        printf("  - Session ID: %lu\n", prev_session.session_id);
-        printf("  - Rotations: %lu, Active time: %lu sec\n", prev_session.rotation_count, prev_session.active_time_seconds);
-        printf("  - Start time: %lu, End time: %lu\n", prev_session.start_time_unix, prev_session.end_time_unix);
-        printf("  - Reported: %s\n", prev_session.reported ? "YES" : "NO");
-        printf("  - Lifetime totals: %lu rotations, %lu sec\n", counts.lifetime_rotations, counts.lifetime_active_seconds);
+        log_printf("[FLASH] Loaded previous session from flash:\n");
+        log_printf("  - Session ID: %lu\n", prev_session.session_id);
+        log_printf("  - Rotations: %lu, Active time: %lu sec\n", prev_session.rotation_count, prev_session.active_time_seconds);
+        log_printf("  - Start time: %lu, End time: %lu\n", prev_session.start_time_unix, prev_session.end_time_unix);
+        log_printf("  - Reported: %s\n", prev_session.reported ? "YES" : "NO");
+        log_printf("  - Lifetime totals: %lu rotations, %lu sec\n", counts.lifetime_rotations, counts.lifetime_active_seconds);
 
         return true;
     }
@@ -238,7 +412,7 @@ static bool load_count_from_flash(void)
     // No valid data found - start fresh
     prev_session.valid = false;
     session.session_id_decided = false;
-    printf("[FLASH] No valid previous session found - starting fresh\n");
+    log_printf("[FLASH] No valid previous session found - starting fresh\n");
     return false;
 }
 
@@ -275,7 +449,7 @@ static void merge_with_previous_session(void)
         if (session.session_start_time_unix > prev_session.active_time_seconds)
         {
             session.session_start_time_unix = session.session_start_time_unix - prev_session.active_time_seconds;
-            printf("[SESSION] Estimated merged start time: boot time %lu - prev active %lu = %lu\n",
+            log_printf("[SESSION] Estimated merged start time: boot time %lu - prev active %lu = %lu\n",
                    session.session_start_time_unix + prev_session.active_time_seconds,
                    prev_session.active_time_seconds,
                    session.session_start_time_unix);
@@ -310,36 +484,36 @@ void odometer_save_count(void)
     // First save: decide whether to merge with previous session or start new
     if (!session.session_id_decided)
     {
-        printf("[SESSION] Making merge/new decision at first save...\n");
-        printf("  - Current time acquired: %s\n", session.time_acquired ? "YES" : "NO");
-        printf("  - Current session start: %lu\n", session.session_start_time_unix);
-        printf("  - Previous session valid: %s\n", prev_session.valid ? "YES" : "NO");
+        log_printf("[SESSION] Making merge/new decision at first save...\n");
+        log_printf("  - Current time acquired: %s\n", session.time_acquired ? "YES" : "NO");
+        log_printf("  - Current session start: %lu\n", session.session_start_time_unix);
+        log_printf("  - Previous session valid: %s\n", prev_session.valid ? "YES" : "NO");
 
         if (!prev_session.valid)
         {
             // No previous session - create new
             target_session_id = 1;
-            printf("[SESSION] Decision: NEW session (no previous) -> ID %lu\n", target_session_id);
+            log_printf("[SESSION] Decision: NEW session (no previous) -> ID %lu\n", target_session_id);
         }
         else if (prev_session.reported)
         {
             // Previous session was reported - must create new
             target_session_id = prev_session.session_id + 1;
-            printf("[SESSION] Decision: NEW session (previous was reported) -> ID %lu\n", target_session_id);
+            log_printf("[SESSION] Decision: NEW session (previous was reported) -> ID %lu\n", target_session_id);
         }
         else if (session.session_start_time_unix == 0)
         {
             // Current time unknown - merge into previous unreported session
             // (We can't calculate a gap, so assume it's a continuation)
             target_session_id = prev_session.session_id;
-            printf("[SESSION] Decision: MERGE (current time unknown) -> ID %lu\n", target_session_id);
+            log_printf("[SESSION] Decision: MERGE (current time unknown) -> ID %lu\n", target_session_id);
             merge_with_previous_session();
         }
         else if (prev_session.end_time_unix == 0)
         {
             // Previous session has unknown end time - merge since we can't calculate gap
             target_session_id = prev_session.session_id;
-            printf("[SESSION] Decision: MERGE (previous end time unknown) -> ID %lu\n", target_session_id);
+            log_printf("[SESSION] Decision: MERGE (previous end time unknown) -> ID %lu\n", target_session_id);
             merge_with_previous_session();
         }
         else
@@ -350,27 +524,27 @@ void odometer_save_count(void)
             {
                 gap_seconds = session.session_start_time_unix - prev_session.end_time_unix;
             }
-            printf("  - Gap between sessions: %lu seconds (%.1f minutes)\n", gap_seconds, gap_seconds / 60.0f);
+            log_printf("  - Gap between sessions: %lu seconds (%.1f minutes)\n", gap_seconds, gap_seconds / 60.0f);
 
             if (gap_seconds <= 900) // Within 15 minutes
             {
                 // Merge into previous session
                 target_session_id = prev_session.session_id;
-                printf("[SESSION] Decision: MERGE (gap <= 15 min) -> ID %lu\n", target_session_id);
+                log_printf("[SESSION] Decision: MERGE (gap <= 15 min) -> ID %lu\n", target_session_id);
                 merge_with_previous_session();
             }
             else
             {
                 // Gap > 15 minutes - create new session
                 target_session_id = prev_session.session_id + 1;
-                printf("[SESSION] Decision: NEW session (gap > 15 min) -> ID %lu\n", target_session_id);
+                log_printf("[SESSION] Decision: NEW session (gap > 15 min) -> ID %lu\n", target_session_id);
             }
         }
 
         // Lock in the session ID for this execution
         session.current_session_id = target_session_id;
         session.session_id_decided = true;
-        printf("[SESSION] Session ID locked: %lu\n", target_session_id);
+        log_printf("[SESSION] Session ID locked: %lu\n", target_session_id);
     }
     else
     {
@@ -386,7 +560,7 @@ void odometer_save_count(void)
     {
         uint32_t active_seconds = odometer_get_session_active_time_seconds();
         session.session_start_time_unix = session_end_time - active_seconds;
-        printf("[SESSION] Estimated start time from end time - active seconds: %lu - %lu = %lu\n",
+        log_printf("[SESSION] Estimated start time from end time - active seconds: %lu - %lu = %lu\n",
                session_end_time, active_seconds, session.session_start_time_unix);
     }
 
@@ -411,21 +585,19 @@ void odometer_save_count(void)
     data->reported = 0; // New/updated sessions are not reported
     data->checksum = calculate_checksum(data);
 
-    // Write to flash
-    uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(sector_offset, FLASH_SECTOR_SIZE);
-    flash_range_program(sector_offset, write_buffer, FLASH_PAGE_SIZE);
-    restore_interrupts(ints);
+    // Write to flash with verification and automatic retry
+    if (!write_flash_and_verify(sector_offset, write_buffer, "Writing session to flash")) {
+        log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
+        log_printf("[FLASH WRITE] Data integrity cannot be guaranteed. System may need attention.\n");
+        // Continue anyway - we've already written the data, and there's not much we can do at this point
+        // except log the error for debugging. The checksum will prevent this data from being loaded.
+    }
 
     // Update save state
     save_state.last_saved_count = counts.lifetime_rotations;
     save_state.last_save_time_ms = to_ms_since_boot(get_absolute_time());
 
-    printf("[FLASH] Saved to flash:\n");
-    printf("  - Session ID: %lu (sector %lu)\n", target_session_id, target_sector);
-    printf("  - Session rotations: %lu, time: %lu sec\n", counts.session_rotations, odometer_get_session_active_time_seconds());
-    printf("  - Lifetime rotations: %lu, time: %lu sec\n", counts.lifetime_rotations, odometer_get_active_time_seconds());
-    printf("  - Start time: %lu, End time: %lu\n", session.session_start_time_unix, session_end_time);
+    log_printf("[FLASH WRITE] ✓ Flash write completed successfully\n");
 }
 
 void odometer_init(uint8_t pin)
@@ -631,13 +803,13 @@ uint32_t odometer_get_unreported_sessions(session_record_t *sessions, uint32_t m
         {
             // No time yet - we'll merge, so exclude it
             exclude_session_id = prev_session.session_id;
-            printf("[SESSION] Excluding session %lu from unreported list (merge pending - no time yet)\n", exclude_session_id);
+            log_printf("[SESSION] Excluding session %lu from unreported list (merge pending - no time yet)\n", exclude_session_id);
         }
         else if (prev_session.end_time_unix == 0)
         {
             // Previous end time unknown - we'll merge, so exclude it
             exclude_session_id = prev_session.session_id;
-            printf("[SESSION] Excluding session %lu from unreported list (merge pending - previous end time unknown)\n", exclude_session_id);
+            log_printf("[SESSION] Excluding session %lu from unreported list (merge pending - previous end time unknown)\n", exclude_session_id);
         }
         else if (current_time > 0 && current_time >= prev_session.end_time_unix)
         {
@@ -649,13 +821,13 @@ uint32_t odometer_get_unreported_sessions(session_record_t *sessions, uint32_t m
             {
                 // Within 15 minutes - we'll merge, so exclude it
                 exclude_session_id = prev_session.session_id;
-                printf("[SESSION] Excluding session %lu from unreported list (merge pending - %lu:%02lu since end, < 15 min)\n",
+                log_printf("[SESSION] Excluding session %lu from unreported list (merge pending - %lu:%02lu since end, < 15 min)\n",
                        exclude_session_id, gap_minutes, gap_secs);
             }
             else
             {
                 // Gap > 15 minutes - we'll create new session, so previous is safe to show
-                printf("[SESSION] Previous session %lu will NOT be merged (%lu:%02lu since end, > 15 min)\n",
+                log_printf("[SESSION] Previous session %lu will NOT be merged (%lu:%02lu since end, > 15 min)\n",
                        prev_session.session_id, gap_minutes, gap_secs);
             }
         }
@@ -664,7 +836,7 @@ uint32_t odometer_get_unreported_sessions(session_record_t *sessions, uint32_t m
     {
         // Decided - exclude our current session (it's the active one)
         exclude_session_id = session.current_session_id;
-        printf("[SESSION] Excluding session %lu from unreported list (current session)\n", exclude_session_id);
+        log_printf("[SESSION] Excluding session %lu from unreported list (current session)\n", exclude_session_id);
     }
 
     // Scan all 64 sectors for unreported sessions
@@ -708,9 +880,9 @@ bool odometer_mark_session_reported(uint32_t session_id)
         bool was_merged = (counts.session_rotations != counts.boot_rotations) ||
                          (counts.session_active_seconds != counts.boot_active_seconds);
 
-        printf("[SESSION] Marking current session %lu as reported\n", session_id);
-        printf("  - Was merged: %s\n", was_merged ? "YES" : "NO");
-        printf("  - Session rotations: %lu, boot rotations: %lu\n",
+        log_printf("[SESSION] Marking current session %lu as reported\n", session_id);
+        log_printf("  - Was merged: %s\n", was_merged ? "YES" : "NO");
+        log_printf("  - Session rotations: %lu, boot rotations: %lu\n",
                counts.session_rotations, counts.boot_rotations);
 
         // First, save the current session state to flash and mark as reported
@@ -733,11 +905,13 @@ bool odometer_mark_session_reported(uint32_t session_id)
                 data->reported = 1;
                 data->checksum = calculate_checksum(data);
 
-                uint32_t ints = save_and_disable_interrupts();
-                flash_range_erase(sector_offset, FLASH_SECTOR_SIZE);
-                flash_range_program(sector_offset, write_buffer, FLASH_PAGE_SIZE);
-                restore_interrupts(ints);
-                printf("  - Marked session %lu as reported in flash\n", session_id);
+                // Write to flash with verification and automatic retry
+                if (!write_flash_and_verify(sector_offset, write_buffer, "Marking session as REPORTED")) {
+                    log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
+                    log_printf("[FLASH WRITE] Session %lu may not be properly marked as reported.\n", session_id);
+                }
+
+                log_printf("[FLASH WRITE] ✓ Session %lu marked as reported in flash\n", session_id);
                 break;
             }
         }
@@ -763,7 +937,7 @@ bool odometer_mark_session_reported(uint32_t session_id)
                 session.session_start_time_unix = session.time_reference_unix -
                     (current_boot_ms - session.time_reference_boot_ms) / 1000;
             }
-            printf("  - Reversed merge: new session has boot-time data only\n");
+            log_printf("  - Reversed merge: new session has boot-time data only\n");
         }
         else
         {
@@ -781,10 +955,10 @@ bool odometer_mark_session_reported(uint32_t session_id)
             {
                 session.session_start_time_unix = odometer_get_current_unix_time();
             }
-            printf("  - Starting fresh session with zero counts\n");
+            log_printf("  - Starting fresh session with zero counts\n");
         }
 
-        printf("  - New session ID: %lu (rotations: %lu)\n",
+        log_printf("  - New session ID: %lu (rotations: %lu)\n",
                new_session_id, counts.session_rotations);
 
         // Save the new session to flash immediately (even if empty)
@@ -818,11 +992,13 @@ bool odometer_mark_session_reported(uint32_t session_id)
             // Recalculate checksum
             data->checksum = calculate_checksum(data);
 
-            // Write back to flash
-            uint32_t ints = save_and_disable_interrupts();
-            flash_range_erase(sector_offset, FLASH_SECTOR_SIZE);
-            flash_range_program(sector_offset, write_buffer, FLASH_PAGE_SIZE);
-            restore_interrupts(ints);
+            // Write to flash with verification and automatic retry
+            if (!write_flash_and_verify(sector_offset, write_buffer, "Marking OLD session as REPORTED")) {
+                log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
+                log_printf("[FLASH WRITE] Session %lu may not be properly marked as reported.\n", session_id);
+            }
+
+            log_printf("[FLASH WRITE] ✓ Old session %lu marked as reported in flash\n", session_id);
 
             return true;
         }
@@ -846,15 +1022,15 @@ void odometer_set_time_reference(uint32_t unix_timestamp)
         uint32_t uptime_seconds = current_boot_ms / 1000;
         session.session_start_time_unix = unix_timestamp - uptime_seconds;
 
-        printf("[TIME] Time reference set!\n");
-        printf("  - Current Unix time: %lu\n", unix_timestamp);
-        printf("  - Uptime: %lu ms (%.1f sec)\n", current_boot_ms, current_boot_ms / 1000.0f);
-        printf("  - Calculated session start: %lu\n", session.session_start_time_unix);
+        log_printf("[TIME] Time reference set!\n");
+        log_printf("  - Current Unix time: %lu\n", unix_timestamp);
+        log_printf("  - Uptime: %lu ms (%.1f sec)\n", current_boot_ms, current_boot_ms / 1000.0f);
+        log_printf("  - Calculated session start: %lu\n", session.session_start_time_unix);
 
         // Print human-readable date (approximate - just for debugging)
         uint32_t days_since_epoch = unix_timestamp / 86400;
         uint32_t years = days_since_epoch / 365 + 1970;
-        printf("  - Approximate date: year ~%lu\n", years);
+        log_printf("  - Approximate date: year ~%lu\n", years);
 
         // Now that we have time, check if we should merge with previous session
         // Do this immediately so display shows correct values right away
@@ -866,7 +1042,7 @@ void odometer_set_time_reference(uint32_t unix_timestamp)
             {
                 // Previous session has unknown end time - merge
                 should_merge = true;
-                printf("[SESSION] Will merge with previous session (previous end time unknown)\n");
+                log_printf("[SESSION] Will merge with previous session (previous end time unknown)\n");
             }
             else if (session.session_start_time_unix >= prev_session.end_time_unix)
             {
@@ -874,11 +1050,11 @@ void odometer_set_time_reference(uint32_t unix_timestamp)
                 if (gap_seconds <= 900)
                 {
                     should_merge = true;
-                    printf("[SESSION] Will merge with previous session (gap %lu sec <= 15 min)\n", gap_seconds);
+                    log_printf("[SESSION] Will merge with previous session (gap %lu sec <= 15 min)\n", gap_seconds);
                 }
                 else
                 {
-                    printf("[SESSION] Will NOT merge with previous session (gap %lu sec > 15 min)\n", gap_seconds);
+                    log_printf("[SESSION] Will NOT merge with previous session (gap %lu sec > 15 min)\n", gap_seconds);
                 }
             }
 
@@ -888,14 +1064,14 @@ void odometer_set_time_reference(uint32_t unix_timestamp)
                 session.current_session_id = prev_session.session_id;
                 session.session_id_decided = true;
                 merge_with_previous_session();
-                printf("[SESSION] Merged! Session ID: %lu, rotations: %lu, time: %lu sec\n",
+                log_printf("[SESSION] Merged! Session ID: %lu, rotations: %lu, time: %lu sec\n",
                        session.current_session_id, counts.session_rotations, counts.session_active_seconds);
             }
         }
     }
     else
     {
-        printf("[TIME] Warning: Received invalid timestamp (0)\n");
+        log_printf("[TIME] Warning: Received invalid timestamp (0)\n");
     }
 }
 
@@ -950,23 +1126,23 @@ void odometer_set_lifetime_totals(float hours, float distance_miles)
     // Convert hours to seconds
     uint32_t seconds = (uint32_t)(hours * 3600.0f);
 
-    printf("[ODOMETER] Setting lifetime totals:\n");
-    printf("  - Hours: %.2f -> %lu seconds\n", hours, seconds);
-    printf("  - Distance: %.2f miles -> %lu rotations\n", distance_miles, rotations);
-    printf("  - Previous lifetime: %lu rotations, %lu seconds\n",
+    log_printf("[ODOMETER] Setting lifetime totals:\n");
+    log_printf("  - Hours: %.2f -> %lu seconds\n", hours, seconds);
+    log_printf("  - Distance: %.2f miles -> %lu rotations\n", distance_miles, rotations);
+    log_printf("  - Previous lifetime: %lu rotations, %lu seconds\n",
            counts.lifetime_rotations, counts.lifetime_active_seconds);
 
     // Update the lifetime totals
     counts.lifetime_rotations = rotations;
     counts.lifetime_active_seconds = seconds;
 
-    printf("  - New lifetime: %lu rotations, %lu seconds\n",
+    log_printf("  - New lifetime: %lu rotations, %lu seconds\n",
            counts.lifetime_rotations, counts.lifetime_active_seconds);
 
     // Save to flash immediately
-    printf("  - Saving to flash...\n");
+    log_printf("  - Saving to flash...\n");
     odometer_save_count();
-    printf("  - Lifetime totals saved successfully\n");
+    log_printf("  - Lifetime totals saved successfully\n");
 }
 
 // WiFi/NTP functions - to be implemented

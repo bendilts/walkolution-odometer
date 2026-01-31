@@ -3,6 +3,7 @@
  */
 
 #include "user_settings.h"
+#include "logging.h"
 #include "pico/stdlib.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
@@ -17,7 +18,6 @@
 // Current settings in RAM
 static user_settings_t current_settings;
 static bool settings_initialized = false;
-static wifi_validation_status_t validation_status = WIFI_VALIDATION_IDLE;
 
 // Forward declarations
 static bool save_settings_to_flash(void);
@@ -25,6 +25,15 @@ static bool save_settings_to_flash(void);
 static uint32_t calculate_checksum(const user_settings_t *settings)
 {
     // XOR of all fields except checksum
+    uint32_t checksum = settings->magic ^ settings->version;
+    checksum ^= settings->metric ? 1 : 0;
+    checksum ^= (uint32_t)settings->timezone_offset_seconds;
+    return checksum;
+}
+
+static uint32_t calculate_checksum_v2(const user_settings_v2_t *settings)
+{
+    // XOR of all fields except checksum (v2 format - with WiFi and timezone)
     uint32_t checksum = settings->magic ^ settings->version;
     checksum ^= settings->metric ? 1 : 0;
 
@@ -76,71 +85,100 @@ static bool load_settings_from_flash(void)
     // Check magic number first
     if (magic != SETTINGS_MAGIC_NUMBER)
     {
-        printf("[SETTINGS] No valid settings in flash (bad magic) - using defaults\n");
+        log_printf("[SETTINGS] No valid settings in flash (bad magic) - using defaults\n");
         return false;
     }
 
     // Handle different versions
     if (version == SETTINGS_VERSION)
     {
-        // Current version (v2) - load directly
+        // Current version (v3) - load directly
         const user_settings_t *flash_settings = (const user_settings_t *)(XIP_BASE + SETTINGS_FLASH_OFFSET);
 
         if (flash_settings->checksum != calculate_checksum(flash_settings))
         {
-            printf("[SETTINGS] v%d settings checksum invalid - using defaults\n", SETTINGS_VERSION);
+            log_printf("[SETTINGS] v%d settings checksum invalid - using defaults\n", SETTINGS_VERSION);
             return false;
         }
 
-        // Valid v2 settings found - copy to RAM
+        // Valid v3 settings found - copy to RAM
         memcpy(&current_settings, flash_settings, sizeof(user_settings_t));
-        printf("[SETTINGS] Loaded v%d settings from flash:\n", SETTINGS_VERSION);
-        printf("  - Metric: %s\n", current_settings.metric ? "YES (km)" : "NO (miles)");
-        printf("  - SSID: %s\n", current_settings.ssid[0] ? current_settings.ssid : "(blank)");
-        printf("  - WiFi password: %s\n", current_settings.wifi_password[0] ? "***" : "(blank)");
-        printf("  - Timezone offset: %ld seconds (%.1f hours)\n",
+        log_printf("[SETTINGS] Loaded v%d settings from flash:\n", SETTINGS_VERSION);
+        log_printf("  - Metric: %s\n", current_settings.metric ? "YES (km)" : "NO (miles)");
+        log_printf("  - Timezone offset: %ld seconds (%.1f hours)\n",
                current_settings.timezone_offset_seconds,
                current_settings.timezone_offset_seconds / 3600.0f);
         return true;
     }
+    else if (version == 2)
+    {
+        // Migrate v2 to v3 (remove WiFi fields)
+        log_printf("[SETTINGS] Found v2 settings, migrating to v%d...\n", SETTINGS_VERSION);
+
+        const user_settings_v2_t *v2_settings = (const user_settings_v2_t *)(XIP_BASE + SETTINGS_FLASH_OFFSET);
+
+        // Validate v2 checksum
+        if (v2_settings->checksum != calculate_checksum_v2(v2_settings))
+        {
+            log_printf("[SETTINGS] v2 settings checksum invalid - using defaults\n");
+            return false;
+        }
+
+        // Migrate v2 fields to current settings (drop WiFi fields)
+        memset(&current_settings, 0, sizeof(user_settings_t));
+        current_settings.magic = SETTINGS_MAGIC_NUMBER;
+        current_settings.version = SETTINGS_VERSION;
+        current_settings.metric = v2_settings->metric;
+        current_settings.timezone_offset_seconds = v2_settings->timezone_offset_seconds;
+
+        log_printf("[SETTINGS] Migrated v2 settings:\n");
+        log_printf("  - Metric: %s\n", current_settings.metric ? "YES (km)" : "NO (miles)");
+        log_printf("  - Timezone offset: %ld seconds (%.1f hours)\n",
+               current_settings.timezone_offset_seconds,
+               current_settings.timezone_offset_seconds / 3600.0f);
+        log_printf("  - WiFi settings removed\n");
+
+        // Save migrated settings as v3
+        save_settings_to_flash();
+        log_printf("[SETTINGS] Migration complete, saved as v%d\n", SETTINGS_VERSION);
+
+        return true;
+    }
     else if (version == 1)
     {
-        // Migrate v1 to v2
-        printf("[SETTINGS] Found v1 settings, migrating to v%d...\n", SETTINGS_VERSION);
+        // Migrate v1 to v3 (drop WiFi fields)
+        log_printf("[SETTINGS] Found v1 settings, migrating to v%d...\n", SETTINGS_VERSION);
 
         const user_settings_v1_t *v1_settings = (const user_settings_v1_t *)(XIP_BASE + SETTINGS_FLASH_OFFSET);
 
         // Validate v1 checksum
         if (v1_settings->checksum != calculate_checksum_v1(v1_settings))
         {
-            printf("[SETTINGS] v1 settings checksum invalid - using defaults\n");
+            log_printf("[SETTINGS] v1 settings checksum invalid - using defaults\n");
             return false;
         }
 
-        // Migrate v1 fields to current settings
+        // Migrate v1 fields to current settings (drop WiFi fields)
         memset(&current_settings, 0, sizeof(user_settings_t));
         current_settings.magic = SETTINGS_MAGIC_NUMBER;
         current_settings.version = SETTINGS_VERSION;
         current_settings.metric = v1_settings->metric;
-        memcpy(current_settings.ssid, v1_settings->ssid, sizeof(current_settings.ssid));
-        memcpy(current_settings.wifi_password, v1_settings->wifi_password, sizeof(current_settings.wifi_password));
         current_settings.timezone_offset_seconds = 0; // Default to UTC for migrated settings
 
-        printf("[SETTINGS] Migrated v1 settings:\n");
-        printf("  - Metric: %s\n", current_settings.metric ? "YES (km)" : "NO (miles)");
-        printf("  - SSID: %s\n", current_settings.ssid[0] ? current_settings.ssid : "(blank)");
-        printf("  - WiFi password: %s\n", current_settings.wifi_password[0] ? "***" : "(blank)");
-        printf("  - Timezone offset: %ld seconds (default UTC)\n", current_settings.timezone_offset_seconds);
+        log_printf("[SETTINGS] Migrated v1 settings:\n");
+        log_printf("  - Metric: %s\n", current_settings.metric ? "YES (km)" : "NO (miles)");
+        log_printf("  - Timezone offset: %ld seconds (default UTC)\n", current_settings.timezone_offset_seconds);
+        log_printf("  - WiFi settings removed\n");
 
-        // Save migrated settings as v2
+        // Save migrated settings as v3
         save_settings_to_flash();
-        printf("[SETTINGS] Migration complete, saved as v%d\n", SETTINGS_VERSION);
+        log_printf("[SETTINGS] Migration complete, saved as v%d\n", SETTINGS_VERSION);
 
         return true;
     }
     else
     {
-        printf("[SETTINGS] Unknown settings version %lu - using defaults\n", version);
+        log_printf("[SETTINGS] Unknown settings version %lu - using defaults\n", version);
         return false;
     }
 }
@@ -151,12 +189,10 @@ static void create_default_settings(void)
     current_settings.magic = SETTINGS_MAGIC_NUMBER;
     current_settings.version = SETTINGS_VERSION;
     current_settings.metric = false; // Default to miles
-    current_settings.ssid[0] = '\0';
-    current_settings.wifi_password[0] = '\0';
     current_settings.timezone_offset_seconds = 0; // Default to UTC
     current_settings.checksum = calculate_checksum(&current_settings);
 
-    printf("[SETTINGS] Created default v%d settings (miles, blank WiFi, UTC timezone)\n", SETTINGS_VERSION);
+    log_printf("[SETTINGS] Created default v%d settings (miles, UTC timezone)\n", SETTINGS_VERSION);
 }
 
 static bool save_settings_to_flash(void)
@@ -175,7 +211,7 @@ static bool save_settings_to_flash(void)
     flash_range_program(SETTINGS_FLASH_OFFSET, write_buffer, FLASH_PAGE_SIZE);
     restore_interrupts(ints);
 
-    printf("[SETTINGS] Saved to flash\n");
+    log_printf("[SETTINGS] Saved to flash\n");
     return true;
 }
 
@@ -186,7 +222,7 @@ void user_settings_init(void)
         return;
     }
 
-    printf("[SETTINGS] Initializing...\n");
+    log_printf("[SETTINGS] Initializing...\n");
 
     // Try to load from flash
     if (!load_settings_from_flash())
@@ -211,66 +247,21 @@ const user_settings_t* user_settings_get(void)
     return &current_settings;
 }
 
-bool user_settings_update(bool metric, const char *ssid, const char *wifi_password)
+bool user_settings_update(bool metric)
 {
     if (!settings_initialized)
     {
         user_settings_init();
     }
 
-    printf("[SETTINGS] Updating settings:\n");
-    printf("  - Metric: %s\n", metric ? "YES (km)" : "NO (miles)");
-    printf("  - SSID: %s\n", ssid && ssid[0] ? ssid : "(blank)");
-    printf("  - Password: %s\n", wifi_password && wifi_password[0] ? "***" : "(blank)");
+    log_printf("[SETTINGS] Updating settings:\n");
+    log_printf("  - Metric: %s\n", metric ? "YES (km)" : "NO (miles)");
 
     // Update settings in RAM
     current_settings.metric = metric;
 
-    // Copy SSID (ensure null termination)
-    if (ssid != NULL)
-    {
-        strncpy(current_settings.ssid, ssid, sizeof(current_settings.ssid) - 1);
-        current_settings.ssid[sizeof(current_settings.ssid) - 1] = '\0';
-    }
-    else
-    {
-        current_settings.ssid[0] = '\0';
-    }
-
-    // Copy password (ensure null termination)
-    if (wifi_password != NULL)
-    {
-        strncpy(current_settings.wifi_password, wifi_password, sizeof(current_settings.wifi_password) - 1);
-        current_settings.wifi_password[sizeof(current_settings.wifi_password) - 1] = '\0';
-    }
-    else
-    {
-        current_settings.wifi_password[0] = '\0';
-    }
-
     // Save to flash
     return save_settings_to_flash();
-}
-
-void user_settings_get_wifi_credentials(char *ssid_out, size_t ssid_size,
-                                        char *password_out, size_t password_size)
-{
-    if (!settings_initialized)
-    {
-        user_settings_init();
-    }
-
-    if (ssid_out != NULL && ssid_size > 0)
-    {
-        strncpy(ssid_out, current_settings.ssid, ssid_size - 1);
-        ssid_out[ssid_size - 1] = '\0';
-    }
-
-    if (password_out != NULL && password_size > 0)
-    {
-        strncpy(password_out, current_settings.wifi_password, password_size - 1);
-        password_out[password_size - 1] = '\0';
-    }
 }
 
 bool user_settings_is_metric(void)
@@ -281,27 +272,6 @@ bool user_settings_is_metric(void)
     }
 
     return current_settings.metric;
-}
-
-void user_settings_set_validation_status(wifi_validation_status_t status)
-{
-    validation_status = status;
-
-    const char *status_str = "UNKNOWN";
-    switch (status)
-    {
-        case WIFI_VALIDATION_IDLE: status_str = "IDLE"; break;
-        case WIFI_VALIDATION_TESTING: status_str = "TESTING"; break;
-        case WIFI_VALIDATION_SUCCESS: status_str = "SUCCESS"; break;
-        case WIFI_VALIDATION_FAILED: status_str = "FAILED"; break;
-    }
-
-    printf("[SETTINGS] WiFi validation status: %s\n", status_str);
-}
-
-wifi_validation_status_t user_settings_get_validation_status(void)
-{
-    return validation_status;
 }
 
 int32_t user_settings_get_timezone_offset(void)
@@ -324,7 +294,7 @@ void user_settings_set_timezone_offset(int32_t offset_seconds)
     // Only save if changed
     if (current_settings.timezone_offset_seconds != offset_seconds)
     {
-        printf("[SETTINGS] Updating timezone offset: %ld seconds (%.1f hours)\n",
+        log_printf("[SETTINGS] Updating timezone offset: %ld seconds (%.1f hours)\n",
                offset_seconds, offset_seconds / 3600.0f);
 
         current_settings.timezone_offset_seconds = offset_seconds;

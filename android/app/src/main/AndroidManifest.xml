@@ -14,14 +14,14 @@
     <!-- Internet for Strava API -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- WiFi scanning permissions -->
-    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
-
     <!-- Foreground service permissions -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Alarm permissions for periodic connection attempts -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
@@ -78,6 +78,13 @@
                     android:host="walkolution" />
             </intent-filter>
         </activity>
+
+        <!-- Logs Activity -->
+        <activity
+            android:name=".LogsActivity"
+            android:exported="false"
+            android:label="Device Logs"
+            android:theme="@style/Theme.WalkolutionOdometer" />
 
         <!-- BLE Background Service -->
         <service

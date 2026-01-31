@@ -1,6 +1,7 @@
 package com.mypeople.walkolutionodometer
 
 import android.Manifest
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -45,21 +46,8 @@ import java.nio.ByteOrder
 import java.util.UUID
 
 data class UserSettings(
-    val metric: Boolean,
-    val ssid: String,
-    val wifiPassword: String
+    val metric: Boolean
 )
-
-enum class WifiValidationStatus(val value: Int) {
-    IDLE(0),
-    TESTING(1),
-    SUCCESS(2),
-    FAILED(3);
-
-    companion object {
-        fun fromValue(value: Int) = values().find { it.value == value } ?: IDLE
-    }
-}
 
 class BleService : Service() {
 
@@ -94,12 +82,17 @@ class BleService : Service() {
     private val _userSettings = MutableStateFlow<UserSettings?>(null)
     val userSettings: StateFlow<UserSettings?> = _userSettings.asStateFlow()
 
-    private val _wifiValidationStatus = MutableStateFlow(WifiValidationStatus.IDLE)
-    val wifiValidationStatus: StateFlow<WifiValidationStatus> = _wifiValidationStatus.asStateFlow()
+    // Log storage - unlimited since logs are now grouped/compressed
+    private val _logMessages = MutableStateFlow<String>("")
+    val logMessages: StateFlow<String> = _logMessages.asStateFlow()
 
     // Notification
     private lateinit var notificationManager: NotificationManager
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // AlarmManager for periodic connection attempts
+    private lateinit var alarmManager: AlarmManager
+    private var periodicConnectionPendingIntent: PendingIntent? = null
 
     // Track pending scan attempts to prevent race conditions
     private var pendingScanRunnable: Runnable? = null
@@ -128,6 +121,9 @@ class BleService : Service() {
             if (action == BluetoothAdapter.ACTION_STATE_CHANGED) {
                 val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
                 handleBluetoothStateChange(state)
+            } else if (action == PERIODIC_CONNECTION_ACTION) {
+                Log.i(TAG, "Periodic connection alarm triggered")
+                handlePeriodicConnectionAttempt()
             }
         }
     }
@@ -140,6 +136,8 @@ class BleService : Service() {
         private const val TAG = "BleService"
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "walkolution_ble_channel"
+        private const val PERIODIC_CONNECTION_ACTION = "com.mypeople.walkolutionodometer.PERIODIC_CONNECTION_ATTEMPT"
+        private const val PERIODIC_CONNECTION_REQUEST_CODE = 1001
 
         // UUIDs matching the Pico
         val ODOMETER_SERVICE_UUID: UUID = UUID.fromString("12345678-1234-5678-1234-56789abcdef0")
@@ -148,8 +146,8 @@ class BleService : Service() {
         val MARK_REPORTED_CHARACTERISTIC_UUID: UUID = UUID.fromString("12345678-1234-5678-1234-56789abcdef3")
         val TIME_SYNC_CHARACTERISTIC_UUID: UUID = UUID.fromString("12345678-1234-5678-1234-56789abcdef4")
         val USER_SETTINGS_CHARACTERISTIC_UUID: UUID = UUID.fromString("12345678-1234-5678-1234-56789abcdef5")
-        val WIFI_VALIDATION_STATUS_CHARACTERISTIC_UUID: UUID = UUID.fromString("12345678-1234-5678-1234-56789abcdef6")
         val SET_LIFETIME_TOTALS_CHARACTERISTIC_UUID: UUID = UUID.fromString("12345678-1234-5678-1234-56789abcdef7")
+        val LOGS_CHARACTERISTIC_UUID: UUID = UUID.fromString("12345678-1234-5678-1234-56789abcdef8")
         val CLIENT_CHARACTERISTIC_CONFIG_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         const val CM_PER_ROTATION = 34.56f
@@ -166,13 +164,21 @@ class BleService : Service() {
         bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
 
         notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        alarmManager = getSystemService(ALARM_SERVICE) as AlarmManager
         sessionCacheManager = SessionCacheManager(this)
 
         createNotificationChannel()
 
-        // Register Bluetooth state change receiver
-        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-        registerReceiver(bluetoothStateReceiver, filter)
+        // Register Bluetooth state change receiver and periodic connection receiver
+        val filter = IntentFilter().apply {
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+            addAction(PERIODIC_CONNECTION_ACTION)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(bluetoothStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(bluetoothStateReceiver, filter)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -207,6 +213,9 @@ class BleService : Service() {
         // Start watchdog to detect stuck states
         startWatchdog()
 
+        // Schedule periodic connection attempts
+        schedulePeriodicConnectionAttempts()
+
         return START_STICKY
     }
 
@@ -233,6 +242,9 @@ class BleService : Service() {
         // Cancel watchdog
         watchdogRunnable?.let { mainHandler.removeCallbacks(it) }
         watchdogRunnable = null
+
+        // Cancel periodic connection attempts
+        cancelPeriodicConnectionAttempts()
 
         stopBluetoothScan()
         if (hasBluetoothConnectPermission()) {
@@ -434,6 +446,10 @@ class BleService : Service() {
     }
 
     private fun cleanupGatt() {
+        stopLogPolling()
+        // Clear any pending BLE requests
+        bleRequestQueue.clear()
+        processingBleRequest = false
         try {
             if (hasBluetoothConnectPermission()) {
                 bluetoothGatt?.disconnect()
@@ -461,6 +477,97 @@ class BleService : Service() {
             // Force re-get the scanner instance
             bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
             Log.i(TAG, "BLE scanner reset")
+        }
+    }
+
+    // Schedule periodic connection attempts using AlarmManager (every 30 minutes)
+    private fun schedulePeriodicConnectionAttempts() {
+        val intent = Intent(PERIODIC_CONNECTION_ACTION).apply {
+            setPackage(packageName)
+        }
+
+        periodicConnectionPendingIntent = PendingIntent.getBroadcast(
+            this,
+            PERIODIC_CONNECTION_REQUEST_CODE,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // Schedule for every 30 minutes
+        val intervalMillis = 30 * 60 * 1000L // 30 minutes
+        val triggerAtMillis = System.currentTimeMillis() + intervalMillis
+
+        try {
+            // Use setExactAndAllowWhileIdle to work even in Doze mode
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.RTC_WAKEUP,
+                    triggerAtMillis,
+                    periodicConnectionPendingIntent!!
+                )
+            } else {
+                alarmManager.setExact(
+                    AlarmManager.RTC_WAKEUP,
+                    triggerAtMillis,
+                    periodicConnectionPendingIntent!!
+                )
+            }
+            Log.i(TAG, "Scheduled periodic connection attempt in 30 minutes")
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Failed to schedule periodic alarm: ${e.message}")
+        }
+    }
+
+    // Cancel periodic connection attempts
+    private fun cancelPeriodicConnectionAttempts() {
+        periodicConnectionPendingIntent?.let {
+            alarmManager.cancel(it)
+            it.cancel()
+            Log.i(TAG, "Cancelled periodic connection attempts")
+        }
+        periodicConnectionPendingIntent = null
+    }
+
+    // Handle periodic connection attempt triggered by alarm
+    private fun handlePeriodicConnectionAttempt() {
+        Log.i(TAG, "=== PERIODIC CONNECTION ATTEMPT ===")
+        Log.i(TAG, "Connected: ${_isConnected.value}, Connecting: $isConnecting, Scanning: ${_scanning.value}")
+
+        // Reschedule for next interval
+        schedulePeriodicConnectionAttempts()
+
+        // Only attempt connection if not already connected or connecting
+        if (!_isConnected.value && !isConnecting) {
+            // Check if we have permissions and Bluetooth is enabled
+            if (!hasBluetoothPermissions()) {
+                Log.w(TAG, "Periodic attempt skipped: missing permissions")
+                _connectionStatus.value = "Missing Bluetooth permissions"
+                updateNotification()
+                return
+            }
+
+            if (bluetoothAdapter?.isEnabled != true) {
+                Log.w(TAG, "Periodic attempt skipped: Bluetooth is OFF")
+                _connectionStatus.value = "Bluetooth is OFF"
+                updateNotification()
+                return
+            }
+
+            Log.i(TAG, "Periodic attempt: forcing scan restart")
+
+            // Cancel any pending scan attempts
+            pendingScanRunnable?.let { mainHandler.removeCallbacks(it) }
+            pendingScanRunnable = null
+
+            // Reset the scanner and start fresh
+            resetBluetoothScanner()
+
+            // Start scan immediately
+            mainHandler.post {
+                startBluetoothScan()
+            }
+        } else {
+            Log.i(TAG, "Periodic attempt skipped: already connected or connecting")
         }
     }
 
@@ -706,6 +813,9 @@ class BleService : Service() {
                     _connectionStatus.value = "Disconnected"
                     notificationsEnabled = false
 
+                    // Stop log polling on disconnect
+                    stopLogPolling()
+
                     cleanupGatt()
 
                     // Cancel any pending scan and schedule a new one
@@ -798,8 +908,11 @@ class BleService : Service() {
                     Log.i(TAG, "Notifications enabled successfully!")
                     _connectionStatus.value = "Connected"
 
+                    // Start the BLE request queue with initial setup sequence
                     mainHandler.postDelayed({
-                        sendTimeSync()
+                        enqueueBleRequest(BleRequest.SendTimeSync)
+                        // ReadUserSettings, ReadSessionsList, and StartLogPolling will be queued
+                        // automatically by the time sync completion callback
                     }, 100)
                 } else {
                     notificationsEnabled = false
@@ -821,17 +934,24 @@ class BleService : Service() {
                 when (characteristic.uuid) {
                     TIME_SYNC_CHARACTERISTIC_UUID -> {
                         Log.i(TAG, "Time sync sent successfully")
-                        mainHandler.postDelayed({
-                            readUserSettings()
-                            // Sessions list will be read after user settings completes
-                        }, 500)
+                        // Complete the request and queue next operations
+                        completeBleRequest()
+                        enqueueBleRequest(BleRequest.ReadUserSettings)
+                        enqueueBleRequest(BleRequest.ReadSessionsList)
+                        enqueueBleRequest(BleRequest.StartLogPolling)
                     }
                     MARK_REPORTED_CHARACTERISTIC_UUID -> {
                         Log.i(TAG, "Session marked as reported successfully")
+                        completeBleRequest()
+                    }
+                    USER_SETTINGS_CHARACTERISTIC_UUID -> {
+                        Log.i(TAG, "User settings written successfully")
+                        completeBleRequest()
                     }
                 }
             } else {
                 Log.w(TAG, "Characteristic write failed: ${characteristic.uuid}, status=$status")
+                completeBleRequest()
             }
         }
 
@@ -843,18 +963,23 @@ class BleService : Service() {
                     SESSIONS_LIST_CHARACTERISTIC_UUID -> {
                         Log.i(TAG, "Sessions list read successful, ${value.size} bytes")
                         parseSessionsList(value)
+                        completeBleRequest()
                     }
                     USER_SETTINGS_CHARACTERISTIC_UUID -> {
                         parseUserSettings(value)
-                        // Chain sessions list read after user settings completes
-                        mainHandler.postDelayed({
-                            readSessionsList()
-                        }, 50)
+                        completeBleRequest()
                     }
-                    WIFI_VALIDATION_STATUS_CHARACTERISTIC_UUID -> parseWifiValidationStatus(value)
+                    LOGS_CHARACTERISTIC_UUID -> {
+                        parseLogs(value)
+                        // This is polled, not queued, so don't complete
+                    }
                 }
             } else {
                 Log.w(TAG, "Characteristic read failed: ${characteristic.uuid}, status=$status")
+                // Complete request even on failure to avoid queue getting stuck
+                when (characteristic.uuid) {
+                    SESSIONS_LIST_CHARACTERISTIC_UUID, USER_SETTINGS_CHARACTERISTIC_UUID -> completeBleRequest()
+                }
             }
         }
 
@@ -871,19 +996,24 @@ class BleService : Service() {
                         SESSIONS_LIST_CHARACTERISTIC_UUID -> {
                             Log.i(TAG, "Sessions list read successful (deprecated API), ${value.size} bytes")
                             parseSessionsList(value)
+                            completeBleRequest()
                         }
                         USER_SETTINGS_CHARACTERISTIC_UUID -> {
                             parseUserSettings(value)
-                            // Chain sessions list read after user settings completes
-                            mainHandler.postDelayed({
-                                readSessionsList()
-                            }, 50)
+                            completeBleRequest()
                         }
-                        WIFI_VALIDATION_STATUS_CHARACTERISTIC_UUID -> parseWifiValidationStatus(value)
+                        LOGS_CHARACTERISTIC_UUID -> {
+                            parseLogs(value)
+                            // This is polled, not queued, so don't complete
+                        }
                     }
                 } ?: Log.w(TAG, "Characteristic value is null")
             } else {
                 Log.w(TAG, "Characteristic read failed: ${characteristic.uuid}, status=$status")
+                // Complete request even on failure to avoid queue getting stuck
+                when (characteristic.uuid) {
+                    SESSIONS_LIST_CHARACTERISTIC_UUID, USER_SETTINGS_CHARACTERISTIC_UUID -> completeBleRequest()
+                }
             }
         }
 
@@ -1114,27 +1244,39 @@ class BleService : Service() {
         }
     }
 
+    // Public API to read sessions list (queues the request)
     private fun readSessionsList() {
+        enqueueBleRequest(BleRequest.ReadSessionsList)
+    }
+
+    // Execute sessions list read
+    private fun executeReadSessionsList() {
+        Log.i(TAG, "Executing read sessions list")
+
         if (!hasBluetoothConnectPermission()) {
-            Log.w(TAG, "readSessionsList: No Bluetooth connect permission")
+            Log.w(TAG, "Cannot read sessions list - missing permission")
+            completeBleRequest()
             return
         }
 
         val service = bluetoothGatt?.getService(ODOMETER_SERVICE_UUID)
         if (service == null) {
-            Log.w(TAG, "readSessionsList: Service not found")
+            Log.w(TAG, "Cannot read sessions list - service not found")
+            completeBleRequest()
             return
         }
 
         val characteristic = service.getCharacteristic(SESSIONS_LIST_CHARACTERISTIC_UUID)
         if (characteristic == null) {
-            Log.w(TAG, "readSessionsList: Characteristic not found")
+            Log.w(TAG, "Cannot read sessions list - characteristic not found")
+            completeBleRequest()
             return
         }
 
         Log.d(TAG, "Reading sessions list characteristic... UUID=${characteristic.uuid}")
         val result = bluetoothGatt?.readCharacteristic(characteristic)
         Log.d(TAG, "readCharacteristic returned: $result")
+        // Will be completed in onCharacteristicRead callback
     }
 
     private fun parseSessionsList(data: ByteArray) {
@@ -1206,40 +1348,33 @@ class BleService : Service() {
     private fun parseUserSettings(data: ByteArray) {
         Log.d(TAG, "parseUserSettings: received ${data.size} bytes")
 
-        if (data.size != 193) {
-            Log.e(TAG, "Invalid user settings size: ${data.size} bytes, expected 193")
+        if (data.size != 1) {
+            Log.e(TAG, "Invalid user settings size: ${data.size} bytes, expected 1")
             return
         }
 
         val metric = data[0].toInt() != 0
 
-        // Parse SSID (64 bytes)
-        val ssidBytes = ByteArray(64)
-        System.arraycopy(data, 1, ssidBytes, 0, 64)
-        val ssid = String(ssidBytes, Charsets.UTF_8).trim('\u0000')
-
-        // Parse WiFi password (128 bytes)
-        val passwordBytes = ByteArray(128)
-        System.arraycopy(data, 65, passwordBytes, 0, 128)
-        val wifiPassword = String(passwordBytes, Charsets.UTF_8).trim('\u0000')
-
-        _userSettings.value = UserSettings(metric, ssid, wifiPassword)
-        Log.i(TAG, "Loaded user settings: metric=$metric, ssid=$ssid")
+        _userSettings.value = UserSettings(metric)
+        Log.i(TAG, "Loaded user settings: metric=$metric")
     }
 
-    private fun parseWifiValidationStatus(data: ByteArray) {
-        if (data.size < 1) {
-            Log.e(TAG, "Invalid WiFi validation status size: ${data.size} bytes")
+    // Public API to mark session reported (queues the request)
+    fun markSessionReported(sessionId: Int) {
+        enqueueBleRequest(BleRequest.MarkSessionReported(sessionId))
+        // Also queue a sessions list read to refresh the list
+        enqueueBleRequest(BleRequest.ReadSessionsList)
+    }
+
+    // Execute mark session reported
+    private fun executeMarkSessionReported(sessionId: Int) {
+        Log.i(TAG, "Executing mark session $sessionId as reported")
+
+        if (!hasBluetoothConnectPermission()) {
+            Log.w(TAG, "Cannot mark session reported - missing permission")
+            completeBleRequest()
             return
         }
-
-        val status = WifiValidationStatus.fromValue(data[0].toInt())
-        _wifiValidationStatus.value = status
-        Log.i(TAG, "WiFi validation status: $status")
-    }
-
-    fun markSessionReported(sessionId: Int) {
-        if (!hasBluetoothConnectPermission()) return
 
         val service = bluetoothGatt?.getService(ODOMETER_SERVICE_UUID)
         val characteristic = service?.getCharacteristic(MARK_REPORTED_CHARACTERISTIC_UUID)
@@ -1259,18 +1394,36 @@ class BleService : Service() {
                 @Suppress("DEPRECATION")
                 bluetoothGatt?.writeCharacteristic(characteristic)
             }
-
-            mainHandler.postDelayed({
-                readSessionsList()
-            }, 500)
+            // Will be completed in onCharacteristicWrite callback
+        } else {
+            Log.w(TAG, "Mark reported characteristic not found")
+            completeBleRequest()
         }
     }
 
+    // Public API to send time sync (queues the request)
     private fun sendTimeSync() {
-        if (!hasBluetoothConnectPermission()) return
+        enqueueBleRequest(BleRequest.SendTimeSync)
+    }
+
+    // Execute time sync write
+    private fun executeSendTimeSync() {
+        Log.i(TAG, "Executing time sync")
+
+        if (!hasBluetoothConnectPermission()) {
+            Log.w(TAG, "Cannot send time sync - missing permission")
+            completeBleRequest()
+            return
+        }
 
         val service = bluetoothGatt?.getService(ODOMETER_SERVICE_UUID)
-        val characteristic = service?.getCharacteristic(TIME_SYNC_CHARACTERISTIC_UUID)
+        if (service == null) {
+            Log.w(TAG, "Cannot send time sync - service not found")
+            completeBleRequest()
+            return
+        }
+
+        val characteristic = service.getCharacteristic(TIME_SYNC_CHARACTERISTIC_UUID)
         if (characteristic != null) {
             val unixTimestamp = (System.currentTimeMillis() / 1000).toInt()
 
@@ -1284,8 +1437,8 @@ class BleService : Service() {
             buffer.putInt(timezoneOffsetSeconds)
             val data = buffer.array()
 
-            Log.d(TAG, "Sending time sync: timestamp=$unixTimestamp, timezone_offset=${timezoneOffsetSeconds}s (${timezoneOffsetSeconds/3600.0f}h)")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Log.i(TAG, "Sending time sync: timestamp=$unixTimestamp, timezone_offset=${timezoneOffsetSeconds}s (${timezoneOffsetSeconds/3600.0f}h)")
+            val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 bluetoothGatt?.writeCharacteristic(characteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
             } else {
                 @Suppress("DEPRECATION")
@@ -1295,10 +1448,11 @@ class BleService : Service() {
                 @Suppress("DEPRECATION")
                 bluetoothGatt?.writeCharacteristic(characteristic)
             }
+            Log.i(TAG, "Time sync write result: $result")
+            // Will be completed in onCharacteristicWrite callback
         } else {
-            mainHandler.postDelayed({
-                readSessionsList()
-            }, 500)
+            Log.w(TAG, "Time sync characteristic not found")
+            completeBleRequest()
         }
     }
 
@@ -1395,44 +1549,55 @@ class BleService : Service() {
         _unreportedSessions.value = sessions
     }
 
-    // Read user settings from Pico
+    // Public API to read user settings (queues the request)
     fun readUserSettings() {
-        if (!hasBluetoothConnectPermission()) return
+        enqueueBleRequest(BleRequest.ReadUserSettings)
+    }
+
+    // Execute user settings read
+    private fun executeReadUserSettings() {
+        Log.i(TAG, "Executing read user settings")
+
+        if (!hasBluetoothConnectPermission()) {
+            Log.w(TAG, "Cannot read user settings - missing permission")
+            completeBleRequest()
+            return
+        }
 
         val service = bluetoothGatt?.getService(ODOMETER_SERVICE_UUID)
         val characteristic = service?.getCharacteristic(USER_SETTINGS_CHARACTERISTIC_UUID)
         if (characteristic != null) {
             Log.d(TAG, "Reading user settings characteristic...")
             bluetoothGatt?.readCharacteristic(characteristic)
+            // Will be completed in onCharacteristicRead callback
+        } else {
+            Log.w(TAG, "User settings characteristic not found")
+            completeBleRequest()
         }
     }
 
-    // Write user settings to Pico
-    fun writeUserSettings(metric: Boolean, ssid: String, wifiPassword: String) {
-        if (!hasBluetoothConnectPermission()) return
+    // Public API to write user settings (queues the request)
+    fun writeUserSettings(metric: Boolean) {
+        enqueueBleRequest(BleRequest.WriteUserSettings(metric))
+    }
+
+    // Execute write user settings
+    private fun executeWriteUserSettings(metric: Boolean) {
+        Log.i(TAG, "Executing write user settings")
+
+        if (!hasBluetoothConnectPermission()) {
+            Log.w(TAG, "Cannot write user settings - missing permission")
+            completeBleRequest()
+            return
+        }
 
         val service = bluetoothGatt?.getService(ODOMETER_SERVICE_UUID)
         val characteristic = service?.getCharacteristic(USER_SETTINGS_CHARACTERISTIC_UUID)
         if (characteristic != null) {
-            // Create 193-byte packet: 1 byte metric + 64 bytes SSID + 128 bytes password
-            val buffer = ByteBuffer.allocate(193).order(ByteOrder.LITTLE_ENDIAN)
-            buffer.put(if (metric) 1.toByte() else 0.toByte())
+            // Create 1-byte packet: metric only (no WiFi)
+            val data = byteArrayOf(if (metric) 1.toByte() else 0.toByte())
 
-            // SSID (64 bytes, null-padded)
-            val ssidBytes = ByteArray(64)
-            val ssidData = ssid.toByteArray(Charsets.UTF_8).take(63).toByteArray()
-            System.arraycopy(ssidData, 0, ssidBytes, 0, ssidData.size)
-            buffer.put(ssidBytes)
-
-            // WiFi password (128 bytes, null-padded)
-            val passwordBytes = ByteArray(128)
-            val passwordData = wifiPassword.toByteArray(Charsets.UTF_8).take(127).toByteArray()
-            System.arraycopy(passwordData, 0, passwordBytes, 0, passwordData.size)
-            buffer.put(passwordBytes)
-
-            val data = buffer.array()
-
-            Log.d(TAG, "Writing user settings: metric=$metric, ssid=$ssid")
+            Log.d(TAG, "Writing user settings: metric=$metric")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 bluetoothGatt?.writeCharacteristic(characteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
             } else {
@@ -1443,46 +1608,10 @@ class BleService : Service() {
                 @Suppress("DEPRECATION")
                 bluetoothGatt?.writeCharacteristic(characteristic)
             }
-
-            // Only mark validation status as testing if WiFi credentials were provided
-            // If SSID is blank, set to IDLE instead (no validation needed)
-            if (ssid.isNotBlank()) {
-                _wifiValidationStatus.value = WifiValidationStatus.TESTING
-            } else {
-                _wifiValidationStatus.value = WifiValidationStatus.IDLE
-            }
-        }
-    }
-
-    // Read WiFi validation status
-    fun readWifiValidationStatus() {
-        if (!hasBluetoothConnectPermission()) {
-            Log.w(TAG, "Cannot read WiFi validation status - missing permission")
-            return
-        }
-
-        if (bluetoothGatt == null) {
-            Log.w(TAG, "Cannot read WiFi validation status - not connected")
-            return
-        }
-
-        val service = bluetoothGatt?.getService(ODOMETER_SERVICE_UUID)
-        if (service == null) {
-            Log.w(TAG, "Cannot read WiFi validation status - service not found")
-            return
-        }
-
-        val characteristic = service.getCharacteristic(WIFI_VALIDATION_STATUS_CHARACTERISTIC_UUID)
-        if (characteristic != null) {
-            Log.d(TAG, "Reading WiFi validation status characteristic...")
-            try {
-                val success = bluetoothGatt?.readCharacteristic(characteristic)
-                Log.d(TAG, "Read WiFi validation status request: ${if (success == true) "success" else "failed"}")
-            } catch (e: Exception) {
-                Log.e(TAG, "Exception reading WiFi validation status: ${e.message}")
-            }
+            // Will be completed in onCharacteristicWrite callback
         } else {
-            Log.w(TAG, "WiFi validation status characteristic not found")
+            Log.w(TAG, "User settings characteristic not found")
+            completeBleRequest()
         }
     }
 
@@ -1521,5 +1650,214 @@ class BleService : Service() {
         } else {
             Log.w(TAG, "Set lifetime totals characteristic not found")
         }
+    }
+
+    // Track if last log read returned data (for adaptive polling)
+    private var lastLogReadHadData = false
+
+    // Track if LogsActivity is visible (for adaptive polling)
+    private var logsActivityVisible = false
+
+    // BLE request queue for serializing operations
+    private sealed class BleRequest {
+        object SendTimeSync : BleRequest()
+        object ReadUserSettings : BleRequest()
+        object ReadSessionsList : BleRequest()
+        object StartLogPolling : BleRequest()
+        data class MarkSessionReported(val sessionId: Int) : BleRequest()
+        data class WriteUserSettings(val metric: Boolean) : BleRequest()
+    }
+    private val bleRequestQueue = mutableListOf<BleRequest>()
+    private var processingBleRequest = false
+
+    // Enqueue a BLE request and process if not already processing
+    private fun enqueueBleRequest(request: BleRequest) {
+        bleRequestQueue.add(request)
+        Log.d(TAG, "Enqueued BLE request: ${request::class.simpleName}, queue size: ${bleRequestQueue.size}")
+        processNextBleRequest()
+    }
+
+    // Process the next BLE request in the queue
+    private fun processNextBleRequest() {
+        if (processingBleRequest) {
+            Log.v(TAG, "Already processing a BLE request, skipping")
+            return
+        }
+
+        if (bleRequestQueue.isEmpty()) {
+            Log.v(TAG, "BLE request queue is empty")
+            return
+        }
+
+        if (!_isConnected.value || !notificationsEnabled) {
+            Log.w(TAG, "Not connected or notifications disabled, clearing queue")
+            bleRequestQueue.clear()
+            processingBleRequest = false
+            return
+        }
+
+        processingBleRequest = true
+        val request = bleRequestQueue.removeAt(0)
+        Log.i(TAG, "Processing BLE request: ${request::class.simpleName}, ${bleRequestQueue.size} remaining")
+
+        when (request) {
+            is BleRequest.SendTimeSync -> executeSendTimeSync()
+            is BleRequest.ReadUserSettings -> executeReadUserSettings()
+            is BleRequest.ReadSessionsList -> executeReadSessionsList()
+            is BleRequest.StartLogPolling -> executeStartLogPolling()
+            is BleRequest.MarkSessionReported -> executeMarkSessionReported(request.sessionId)
+            is BleRequest.WriteUserSettings -> executeWriteUserSettings(request.metric)
+        }
+    }
+
+    // Mark the current BLE request as complete and process the next one
+    private fun completeBleRequest(delayMs: Long = 50) {
+        Log.d(TAG, "BLE request complete, scheduling next after ${delayMs}ms")
+        processingBleRequest = false
+        mainHandler.postDelayed({
+            processNextBleRequest()
+        }, delayMs)
+    }
+
+    // Runnable for periodic log polling
+    private val logPollingRunnable: Runnable = object : Runnable {
+        override fun run() {
+            if (_isConnected.value && notificationsEnabled) {
+                readLogs()
+                // Adaptive polling based on activity visibility and data availability:
+                // - If last read had data, poll immediately (50ms) to drain the buffer
+                // - If LogsActivity is visible, poll every 1 second
+                // - If LogsActivity is not visible, poll every 60 seconds
+                val delay = when {
+                    lastLogReadHadData -> 50L
+                    logsActivityVisible -> 1000L
+                    else -> 60000L
+                }
+                Log.d(TAG, "Log poll cycle: hadData=$lastLogReadHadData, visible=$logsActivityVisible, nextDelay=${delay}ms")
+                mainHandler.postDelayed(this, delay)
+            } else {
+                Log.w(TAG, "Log polling stopped: connected=${_isConnected.value}, notifications=$notificationsEnabled")
+            }
+        }
+    }
+
+    // Public API to start log polling (queues the request)
+    private fun startLogPolling() {
+        enqueueBleRequest(BleRequest.StartLogPolling)
+    }
+
+    // Execute start log polling
+    private fun executeStartLogPolling() {
+        Log.i(TAG, "========== STARTING LOG POLLING ==========")
+        Log.i(TAG, "Connected: ${_isConnected.value}, Notifications: $notificationsEnabled")
+        mainHandler.removeCallbacks(logPollingRunnable)
+        // Start immediately, then continue every second
+        mainHandler.post(logPollingRunnable)
+        completeBleRequest()
+    }
+
+    // Stop periodic log polling
+    private fun stopLogPolling() {
+        Log.d(TAG, "Stopping log polling")
+        mainHandler.removeCallbacks(logPollingRunnable)
+    }
+
+    // Read logs from device
+    private fun readLogs() {
+        if (!hasBluetoothConnectPermission()) {
+            return
+        }
+
+        val service = bluetoothGatt?.getService(ODOMETER_SERVICE_UUID)
+        if (service == null) {
+            Log.w(TAG, "Cannot read logs - service not found")
+            return
+        }
+
+        val characteristic = service.getCharacteristic(LOGS_CHARACTERISTIC_UUID)
+        if (characteristic == null) {
+            Log.w(TAG, "Cannot read logs - characteristic not found")
+            return
+        }
+
+        try {
+            val result = bluetoothGatt?.readCharacteristic(characteristic)
+            Log.v(TAG, "Read logs characteristic: result=$result")
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception reading logs: ${e.message}")
+        }
+    }
+
+    // Parse and append logs data
+    private fun parseLogs(data: ByteArray) {
+        if (data.isEmpty()) {
+            Log.d(TAG, "Received empty log data (no new logs)")
+            lastLogReadHadData = false
+            return
+        }
+
+        try {
+            // Convert bytes to string and append to existing logs
+            val newLogs = String(data, Charsets.UTF_8)
+            val currentLogs = _logMessages.value + newLogs
+
+            _logMessages.value = currentLogs
+            lastLogReadHadData = true
+            Log.d(TAG, "Received ${data.size} bytes of logs: ${newLogs.take(50)}... (total: ${currentLogs.length} chars, will poll again immediately)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception parsing logs: ${e.message}")
+            lastLogReadHadData = false
+        }
+    }
+
+    // Get current accumulated logs
+    fun getCurrentLogs(): String {
+        return _logMessages.value
+    }
+
+    // Clear all accumulated logs
+    fun clearLogs() {
+        Log.i(TAG, "Clearing all accumulated logs")
+        _logMessages.value = ""
+    }
+
+    // Manually trigger a log read and drain buffer (for manual refresh)
+    fun triggerLogRead() {
+        Log.i(TAG, "Manual log read triggered - will drain buffer")
+        if (_isConnected.value && notificationsEnabled) {
+            // Remove scheduled poll and force rapid polling to drain buffer
+            mainHandler.removeCallbacks(logPollingRunnable)
+            lastLogReadHadData = true  // Force rapid polling mode
+            mainHandler.post(logPollingRunnable)
+        } else {
+            Log.w(TAG, "Cannot trigger log read - not connected or notifications disabled")
+        }
+    }
+
+    // Called when LogsActivity becomes visible
+    fun onLogsActivityVisible() {
+        Log.i(TAG, "========== LOGS ACTIVITY VISIBLE ==========")
+        Log.i(TAG, "Connected: ${_isConnected.value}, Notifications: $notificationsEnabled")
+        logsActivityVisible = true
+
+        // Trigger an immediate poll when activity becomes visible
+        // Remove any pending polls and restart immediately
+        if (_isConnected.value && notificationsEnabled) {
+            Log.i(TAG, "Cancelling any pending polls and starting immediate log drain")
+            mainHandler.removeCallbacks(logPollingRunnable)
+            // Force immediate read to drain any accumulated logs
+            lastLogReadHadData = true  // This will make it poll rapidly until buffer is drained
+            mainHandler.post(logPollingRunnable)
+            Log.i(TAG, "Log polling restarted in rapid mode")
+        } else {
+            Log.w(TAG, "Cannot start log polling - not connected or notifications disabled")
+        }
+    }
+
+    // Called when LogsActivity becomes hidden
+    fun onLogsActivityHidden() {
+        Log.i(TAG, "LogsActivity is now hidden - decreasing log poll rate")
+        logsActivityVisible = false
+        // No need to restart polling, it will adjust on next iteration
     }
 }

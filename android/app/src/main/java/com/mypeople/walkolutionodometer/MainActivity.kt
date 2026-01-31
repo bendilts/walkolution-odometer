@@ -231,7 +231,8 @@ class MainActivity : ComponentActivity() {
                     isBleConnected = isConnected.value,
                     onOpenSettings = { openSettings() },
                     onOpenSetLifetimeTotals = { openSetLifetimeTotals() },
-                    onOpenStravaSettings = { openStravaSettings() }
+                    onOpenStravaSettings = { openStravaSettings() },
+                    onOpenLogs = { openLogs() }
                 )
             }
         }
@@ -436,6 +437,11 @@ class MainActivity : ComponentActivity() {
         val intent = Intent(this, StravaSettingsActivity::class.java)
         startActivity(intent)
     }
+
+    private fun openLogs() {
+        val intent = Intent(this, LogsActivity::class.java)
+        startActivity(intent)
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -453,7 +459,8 @@ fun OdometerScreenWithTopBar(
     isBleConnected: Boolean,
     onOpenSettings: () -> Unit,
     onOpenSetLifetimeTotals: () -> Unit,
-    onOpenStravaSettings: () -> Unit
+    onOpenStravaSettings: () -> Unit,
+    onOpenLogs: () -> Unit
 ) {
     var showMenu by remember { mutableStateOf(false) }
 
@@ -499,6 +506,13 @@ fun OdometerScreenWithTopBar(
                                 onClick = {
                                     showMenu = false
                                     onOpenSetLifetimeTotals()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Device Logs") },
+                                onClick = {
+                                    showMenu = false
+                                    onOpenLogs()
                                 }
                             )
                         }

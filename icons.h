@@ -12,6 +12,5 @@ typedef struct {
 
 // Available icons
 extern const Icon icon_bluetooth;
-extern const Icon icon_wifi;
 
 #endif // ICONS_H

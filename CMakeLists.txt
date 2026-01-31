@@ -42,6 +42,7 @@ add_executable(walkolution-odometer
     adafruit_fonts.c
     icons.c
     user_settings.c
+    logging.c
     )
 
 # Add current directory to include path for btstack_config.h
@@ -63,7 +64,6 @@ if (PICO_CYW43_SUPPORTED)
         pico_btstack_ble
         pico_btstack_cyw43
         pico_btstack_run_loop_async_context
-        pico_lwip_sntp
     )
     target_compile_definitions(walkolution-odometer PRIVATE
         CYW43_ENABLE_BLUETOOTH=1

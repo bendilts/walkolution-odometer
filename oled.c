@@ -1,4 +1,5 @@
 #include "oled.h"
+#include "logging.h"
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
@@ -88,7 +89,7 @@ static void core1_entry(void) {
         }
 
         if (skipped_frames > 0) {
-            printf("[OLED Core 1] Skipped %lu frame%s (can't keep up)\n",
+            log_printf("[OLED Core 1] Skipped %lu frame%s (can't keep up)\n",
                    skipped_frames, skipped_frames == 1 ? "" : "s");
         }
 
