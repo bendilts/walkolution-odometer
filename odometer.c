@@ -22,12 +22,13 @@
 #define FLASH_SECTOR_COUNT 64
 #define FLASH_START_OFFSET (PICO_FLASH_SIZE_BYTES - (FLASH_SECTOR_SIZE * FLASH_SECTOR_COUNT))
 #define FLASH_MAGIC_NUMBER 0x4F444F53 // "ODOS" in hex (Odometer Session)
+#define FLASH_STRUCT_VERSION 1         // Current struct version (increment when changing flash_data_t)
 
 // Flash storage structure - session-based
 typedef struct
 {
     uint32_t magic;                       // 0x4F444F53 ("ODOS")
-    uint32_t struct_version;              // Version 1
+    uint32_t struct_version;              // FLASH_STRUCT_VERSION (currently 1)
     uint32_t session_id;                  // Monotonically increasing session counter
     uint32_t session_rotation_count;      // Rotations in this session
     uint32_t session_active_time_seconds; // Active time in this session (seconds)
@@ -44,10 +45,8 @@ typedef struct
 {
     uint32_t lifetime_rotations;           // All-time total rotations
     uint32_t lifetime_active_seconds;      // All-time total active seconds
-    uint32_t session_rotations;            // Current session rotations (may include merged data)
-    uint32_t session_active_seconds;       // Current session active time (finalized, may include merged)
-    uint32_t boot_rotations;               // Rotations since THIS boot only (for merge reversal)
-    uint32_t boot_active_seconds;          // Active seconds since THIS boot only (for merge reversal)
+    uint32_t session_rotations;            // Current session rotations
+    uint32_t session_active_seconds;       // Current session active time
     uint32_t last_rotation_time_ms;        // Time of last rotation
     uint32_t active_start_time_ms;         // When current active period started
     bool is_active;                        // Currently counting active time
@@ -62,17 +61,6 @@ typedef struct
     bool time_acquired;                    // Whether we've gotten time from any source
     bool session_id_decided;               // Have we decided our session ID yet?
 } session_state_t;
-
-typedef struct
-{
-    uint32_t session_id;
-    uint32_t rotation_count;
-    uint32_t active_time_seconds;
-    uint32_t start_time_unix;
-    uint32_t end_time_unix;
-    bool reported;
-    bool valid;                            // Was data loaded successfully?
-} previous_session_t;
 
 typedef struct
 {
@@ -96,10 +84,12 @@ typedef struct
 // Global state instances
 static odometer_counts_t counts = {0};
 static session_state_t session = {0};
-static previous_session_t prev_session = {0};
 static sensor_state_t sensor = {0};
 static callbacks_t callbacks = {0};
 static save_state_t save_state = {0};
+
+// Track the highest session ID seen (for creating new sessions)
+static uint32_t last_session_id = 0;
 
 static uint32_t calculate_checksum(const flash_data_t *data)
 {
@@ -321,8 +311,9 @@ static bool load_count_from_flash(void)
         uint32_t sector_offset = FLASH_START_OFFSET + (sector * FLASH_SECTOR_SIZE);
         const flash_data_t *flash_data = (const flash_data_t *)(XIP_BASE + sector_offset);
 
-        // Verify magic number and checksum
+        // Verify magic number, struct version, and checksum
         if (flash_data->magic == FLASH_MAGIC_NUMBER &&
+            flash_data->struct_version <= FLASH_STRUCT_VERSION &&
             flash_data->checksum == calculate_checksum(flash_data))
         {
             // Store this valid session for logging
@@ -337,6 +328,13 @@ static bool load_count_from_flash(void)
                 latest_data = flash_data;
                 found_valid = true;
             }
+        }
+        else if (flash_data->magic == FLASH_MAGIC_NUMBER &&
+                 flash_data->struct_version > FLASH_STRUCT_VERSION)
+        {
+            // Found a session from newer code - log warning
+            log_printf("[FLASH] WARNING: Sector %lu has struct_version %lu (current is %u) - ignoring (newer code)\n",
+                       sector, flash_data->struct_version, FLASH_STRUCT_VERSION);
         }
     }
 
@@ -385,32 +383,23 @@ static bool load_count_from_flash(void)
         counts.lifetime_rotations = latest_data->lifetime_rotation_count;
         counts.lifetime_active_seconds = latest_data->lifetime_time_seconds;
 
-        // Store previous session data for later decision (at first save)
-        prev_session.session_id = latest_data->session_id;
-        prev_session.rotation_count = latest_data->session_rotation_count;
-        prev_session.active_time_seconds = latest_data->session_active_time_seconds;
-        prev_session.start_time_unix = latest_data->session_start_time_unix;
-        prev_session.end_time_unix = latest_data->session_end_time_unix;
-        prev_session.reported = (latest_data->reported != 0);
-        prev_session.valid = true;
+        // Store the highest session ID we've seen
+        last_session_id = latest_data->session_id;
 
-        // Start fresh for this session - will decide merge/new at first save
+        // Start fresh for this session
         counts.session_rotations = 0;
         counts.session_active_seconds = 0;
         session.session_id_decided = false;
 
-        log_printf("[FLASH] Loaded previous session from flash:\n");
-        log_printf("  - Session ID: %lu\n", prev_session.session_id);
-        log_printf("  - Rotations: %lu, Active time: %lu sec\n", prev_session.rotation_count, prev_session.active_time_seconds);
-        log_printf("  - Start time: %lu, End time: %lu\n", prev_session.start_time_unix, prev_session.end_time_unix);
-        log_printf("  - Reported: %s\n", prev_session.reported ? "YES" : "NO");
+        log_printf("[FLASH] Loaded lifetime totals from flash:\n");
+        log_printf("  - Last session ID: %lu\n", last_session_id);
         log_printf("  - Lifetime totals: %lu rotations, %lu sec\n", counts.lifetime_rotations, counts.lifetime_active_seconds);
 
         return true;
     }
 
     // No valid data found - start fresh
-    prev_session.valid = false;
+    last_session_id = 0;
     session.session_id_decided = false;
     log_printf("[FLASH] No valid previous session found - starting fresh\n");
     return false;
@@ -429,42 +418,13 @@ uint32_t odometer_get_current_unix_time(void)
     return session.time_reference_unix + elapsed_seconds;
 }
 
-// Helper function to merge with previous session
-static void merge_with_previous_session(void)
-{
-    // Add previous session's counts to current counts
-    counts.session_rotations += prev_session.rotation_count;
-    counts.session_active_seconds += prev_session.active_time_seconds;
-
-    // Determine the best start time for the merged session
-    if (prev_session.start_time_unix != 0)
-    {
-        // Previous session had a known start time - use it (it's earlier)
-        session.session_start_time_unix = prev_session.start_time_unix;
-    }
-    else if (session.session_start_time_unix != 0)
-    {
-        // Previous had unknown start, but we know current Pico boot time
-        // Estimate: our boot time minus the previous session's walking time
-        if (session.session_start_time_unix > prev_session.active_time_seconds)
-        {
-            session.session_start_time_unix = session.session_start_time_unix - prev_session.active_time_seconds;
-            log_printf("[SESSION] Estimated merged start time: boot time %lu - prev active %lu = %lu\n",
-                   session.session_start_time_unix + prev_session.active_time_seconds,
-                   prev_session.active_time_seconds,
-                   session.session_start_time_unix);
-        }
-    }
-    // else: both unknown, session_start_time_unix stays 0
-}
-
 // Helper function to check if we're allowed to save to flash
 // We require time to be synced OR 60 seconds to have passed since boot
 static bool can_save_to_flash(void)
 {
     if (session.time_acquired)
     {
-        return true; // Time is synced, we can make accurate merge decisions
+        return true; // Time is synced
     }
 
     uint32_t current_boot_ms = to_ms_since_boot(get_absolute_time());
@@ -481,65 +441,17 @@ void odometer_save_count(void)
     uint32_t current_time_unix = odometer_get_current_unix_time();
     uint32_t target_session_id;
 
-    // First save: decide whether to merge with previous session or start new
+    // First save: decide session ID (always create new session, never merge)
     if (!session.session_id_decided)
     {
-        log_printf("[SESSION] Making merge/new decision at first save...\n");
+        log_printf("[SESSION] Assigning session ID at first save...\n");
         log_printf("  - Current time acquired: %s\n", session.time_acquired ? "YES" : "NO");
         log_printf("  - Current session start: %lu\n", session.session_start_time_unix);
-        log_printf("  - Previous session valid: %s\n", prev_session.valid ? "YES" : "NO");
+        log_printf("  - Last session ID from flash: %lu\n", last_session_id);
 
-        if (!prev_session.valid)
-        {
-            // No previous session - create new
-            target_session_id = 1;
-            log_printf("[SESSION] Decision: NEW session (no previous) -> ID %lu\n", target_session_id);
-        }
-        else if (prev_session.reported)
-        {
-            // Previous session was reported - must create new
-            target_session_id = prev_session.session_id + 1;
-            log_printf("[SESSION] Decision: NEW session (previous was reported) -> ID %lu\n", target_session_id);
-        }
-        else if (session.session_start_time_unix == 0)
-        {
-            // Current time unknown - merge into previous unreported session
-            // (We can't calculate a gap, so assume it's a continuation)
-            target_session_id = prev_session.session_id;
-            log_printf("[SESSION] Decision: MERGE (current time unknown) -> ID %lu\n", target_session_id);
-            merge_with_previous_session();
-        }
-        else if (prev_session.end_time_unix == 0)
-        {
-            // Previous session has unknown end time - merge since we can't calculate gap
-            target_session_id = prev_session.session_id;
-            log_printf("[SESSION] Decision: MERGE (previous end time unknown) -> ID %lu\n", target_session_id);
-            merge_with_previous_session();
-        }
-        else
-        {
-            // We know both times - check 15-minute gap
-            uint32_t gap_seconds = 900; // Default to 15 min if we can't calculate
-            if (session.session_start_time_unix > prev_session.end_time_unix)
-            {
-                gap_seconds = session.session_start_time_unix - prev_session.end_time_unix;
-            }
-            log_printf("  - Gap between sessions: %lu seconds (%.1f minutes)\n", gap_seconds, gap_seconds / 60.0f);
-
-            if (gap_seconds <= 900) // Within 15 minutes
-            {
-                // Merge into previous session
-                target_session_id = prev_session.session_id;
-                log_printf("[SESSION] Decision: MERGE (gap <= 15 min) -> ID %lu\n", target_session_id);
-                merge_with_previous_session();
-            }
-            else
-            {
-                // Gap > 15 minutes - create new session
-                target_session_id = prev_session.session_id + 1;
-                log_printf("[SESSION] Decision: NEW session (gap > 15 min) -> ID %lu\n", target_session_id);
-            }
-        }
+        // Always create new session (increment from last seen)
+        target_session_id = last_session_id + 1;
+        log_printf("[SESSION] Decision: NEW session -> ID %lu\n", target_session_id);
 
         // Lock in the session ID for this execution
         session.current_session_id = target_session_id;
@@ -574,7 +486,7 @@ void odometer_save_count(void)
     memset(write_buffer, 0, FLASH_PAGE_SIZE);
 
     data->magic = FLASH_MAGIC_NUMBER;
-    data->struct_version = 1;
+    data->struct_version = FLASH_STRUCT_VERSION;
     data->session_id = target_session_id;
     data->session_rotation_count = counts.session_rotations;
     data->session_active_time_seconds = odometer_get_session_active_time_seconds();
@@ -619,7 +531,7 @@ void odometer_init(uint8_t pin)
         counts.lifetime_active_seconds = 0;
     }
 
-    // Start fresh session - will decide merge/new at first save
+    // Start fresh session
     counts.session_rotations = 0;
     counts.session_active_seconds = 0;
 }
@@ -645,7 +557,6 @@ bool odometer_process(void)
             uint32_t elapsed_seconds = (counts.last_rotation_time_ms - counts.active_start_time_ms) / 1000;
             counts.lifetime_active_seconds += elapsed_seconds;
             counts.session_active_seconds += elapsed_seconds;
-            counts.boot_active_seconds += elapsed_seconds;
             counts.is_active = false;
         }
     }
@@ -658,7 +569,7 @@ bool odometer_process(void)
         if (vsys_mv <= save_state.voltage_threshold_mv)
         {
             // Voltage is low - save immediately before potential power loss
-            // (only if count has changed, time is synced, and at least 1 minute since last save)
+            // (only if count has changed and at least 1 minute since last save)
             if (can_save_to_flash() &&
                 counts.lifetime_rotations != save_state.last_saved_count &&
                 (current_time_ms - save_state.last_save_time_ms) >= FLASH_SAVE_INTERVAL_MS)
@@ -681,7 +592,6 @@ bool odometer_process(void)
             // Complete rotation detected!
             counts.lifetime_rotations++;
             counts.session_rotations++;
-            counts.boot_rotations++;
             rotation_detected = true;
 
             // Update active time tracking
@@ -695,7 +605,7 @@ bool odometer_process(void)
 
             // Check if we should save to flash based on rotation count
             // Save every ROTATION_SAVE_INTERVAL rotations (2500 = ~0.5 miles)
-            // Only save if time is synced (or timeout reached) to ensure accurate merge decisions
+            // Only save if time is synced (or timeout reached)
             if (can_save_to_flash() &&
                 (counts.lifetime_rotations - save_state.last_saved_count) >= ROTATION_SAVE_INTERVAL)
             {
@@ -765,7 +675,6 @@ void odometer_add_rotation(void)
     // Increment rotation counters
     counts.lifetime_rotations++;
     counts.session_rotations++;
-    counts.boot_rotations++;
 
     // Update active time tracking
     counts.last_rotation_time_ms = current_time_ms;
@@ -777,7 +686,7 @@ void odometer_add_rotation(void)
     }
 
     // Check if we should save to flash based on rotation count
-    // Only save if time is synced (or timeout reached) to ensure accurate merge decisions
+    // Only save if time is synced (or timeout reached)
     if (can_save_to_flash() &&
         (counts.lifetime_rotations - save_state.last_saved_count) >= ROTATION_SAVE_INTERVAL)
     {
@@ -790,51 +699,10 @@ uint32_t odometer_get_unreported_sessions(session_record_t *sessions, uint32_t m
 {
     uint32_t count = 0;
 
-    // Determine which session ID to exclude:
-    // - If we haven't decided yet, exclude the previous session (we might merge into it)
-    // - If we decided and merged, exclude the current session (flash data is stale)
+    // Exclude the current active session (if decided)
     uint32_t exclude_session_id = 0;
-    if (!session.session_id_decided && prev_session.valid && !prev_session.reported)
+    if (session.session_id_decided)
     {
-        // Check if we might merge into the previous session
-        uint32_t current_time = odometer_get_current_unix_time();
-
-        if (!session.time_acquired)
-        {
-            // No time yet - we'll merge, so exclude it
-            exclude_session_id = prev_session.session_id;
-            log_printf("[SESSION] Excluding session %lu from unreported list (merge pending - no time yet)\n", exclude_session_id);
-        }
-        else if (prev_session.end_time_unix == 0)
-        {
-            // Previous end time unknown - we'll merge, so exclude it
-            exclude_session_id = prev_session.session_id;
-            log_printf("[SESSION] Excluding session %lu from unreported list (merge pending - previous end time unknown)\n", exclude_session_id);
-        }
-        else if (current_time > 0 && current_time >= prev_session.end_time_unix)
-        {
-            uint32_t gap_seconds = current_time - prev_session.end_time_unix;
-            uint32_t gap_minutes = gap_seconds / 60;
-            uint32_t gap_secs = gap_seconds % 60;
-
-            if (gap_seconds <= 900)
-            {
-                // Within 15 minutes - we'll merge, so exclude it
-                exclude_session_id = prev_session.session_id;
-                log_printf("[SESSION] Excluding session %lu from unreported list (merge pending - %lu:%02lu since end, < 15 min)\n",
-                       exclude_session_id, gap_minutes, gap_secs);
-            }
-            else
-            {
-                // Gap > 15 minutes - we'll create new session, so previous is safe to show
-                log_printf("[SESSION] Previous session %lu will NOT be merged (%lu:%02lu since end, > 15 min)\n",
-                       prev_session.session_id, gap_minutes, gap_secs);
-            }
-        }
-    }
-    else if (session.session_id_decided)
-    {
-        // Decided - exclude our current session (it's the active one)
         exclude_session_id = session.current_session_id;
         log_printf("[SESSION] Excluding session %lu from unreported list (current session)\n", exclude_session_id);
     }
@@ -845,8 +713,9 @@ uint32_t odometer_get_unreported_sessions(session_record_t *sessions, uint32_t m
         uint32_t sector_offset = FLASH_START_OFFSET + (sector * FLASH_SECTOR_SIZE);
         const flash_data_t *flash_data = (const flash_data_t *)(XIP_BASE + sector_offset);
 
-        // Verify magic number and checksum
+        // Verify magic number, struct version, and checksum
         if (flash_data->magic == FLASH_MAGIC_NUMBER &&
+            flash_data->struct_version <= FLASH_STRUCT_VERSION &&
             flash_data->checksum == calculate_checksum(flash_data) &&
             flash_data->reported == 0) // Only unreported sessions
         {
@@ -876,14 +745,7 @@ bool odometer_mark_session_reported(uint32_t session_id)
     // If so, we need to finalize it and start a fresh session
     if (session.session_id_decided && session_id == session.current_session_id)
     {
-        // Check if we merged (boot counts differ from session counts)
-        bool was_merged = (counts.session_rotations != counts.boot_rotations) ||
-                         (counts.session_active_seconds != counts.boot_active_seconds);
-
         log_printf("[SESSION] Marking current session %lu as reported\n", session_id);
-        log_printf("  - Was merged: %s\n", was_merged ? "YES" : "NO");
-        log_printf("  - Session rotations: %lu, boot rotations: %lu\n",
-               counts.session_rotations, counts.boot_rotations);
 
         // First, save the current session state to flash and mark as reported
         // We need to save first to ensure current data is persisted
@@ -896,6 +758,7 @@ bool odometer_mark_session_reported(uint32_t session_id)
             const flash_data_t *flash_data = (const flash_data_t *)(XIP_BASE + sector_offset);
 
             if (flash_data->magic == FLASH_MAGIC_NUMBER &&
+                flash_data->struct_version <= FLASH_STRUCT_VERSION &&
                 flash_data->checksum == calculate_checksum(flash_data) &&
                 flash_data->session_id == session_id)
             {
@@ -920,43 +783,19 @@ bool odometer_mark_session_reported(uint32_t session_id)
         uint32_t new_session_id = session_id + 1;
         session.current_session_id = new_session_id;
 
-        if (was_merged)
+        // Start completely fresh
+        counts.session_rotations = 0;
+        counts.session_active_seconds = 0;
+
+        // Reset speed window since we're starting a new session
+        odometer_reset_speed_window();
+
+        // New session starts now
+        if (session.time_acquired)
         {
-            // If we merged, the new session should have only boot-time data
-            counts.session_rotations = counts.boot_rotations;
-            counts.session_active_seconds = counts.boot_active_seconds;
-
-            // Reset speed window since we're starting fresh tracking
-            // The speed window contains old data from before the merge reversal
-            odometer_reset_speed_window();
-
-            // Update session start time to be our boot time
-            if (session.time_acquired)
-            {
-                uint32_t current_boot_ms = to_ms_since_boot(get_absolute_time());
-                session.session_start_time_unix = session.time_reference_unix -
-                    (current_boot_ms - session.time_reference_boot_ms) / 1000;
-            }
-            log_printf("  - Reversed merge: new session has boot-time data only\n");
+            session.session_start_time_unix = odometer_get_current_unix_time();
         }
-        else
-        {
-            // Not merged - start completely fresh
-            counts.session_rotations = 0;
-            counts.session_active_seconds = 0;
-            counts.boot_rotations = 0;
-            counts.boot_active_seconds = 0;
-
-            // Reset speed window since boot_rotations is being reset
-            odometer_reset_speed_window();
-
-            // New session starts now
-            if (session.time_acquired)
-            {
-                session.session_start_time_unix = odometer_get_current_unix_time();
-            }
-            log_printf("  - Starting fresh session with zero counts\n");
-        }
+        log_printf("  - Starting fresh session with zero counts\n");
 
         log_printf("  - New session ID: %lu (rotations: %lu)\n",
                new_session_id, counts.session_rotations);
@@ -976,6 +815,7 @@ bool odometer_mark_session_reported(uint32_t session_id)
 
         // Check if this is the session we're looking for
         if (flash_data->magic == FLASH_MAGIC_NUMBER &&
+            flash_data->struct_version <= FLASH_STRUCT_VERSION &&
             flash_data->checksum == calculate_checksum(flash_data) &&
             flash_data->session_id == session_id)
         {
@@ -1031,43 +871,6 @@ void odometer_set_time_reference(uint32_t unix_timestamp)
         uint32_t days_since_epoch = unix_timestamp / 86400;
         uint32_t years = days_since_epoch / 365 + 1970;
         log_printf("  - Approximate date: year ~%lu\n", years);
-
-        // Now that we have time, check if we should merge with previous session
-        // Do this immediately so display shows correct values right away
-        if (!session.session_id_decided && prev_session.valid && !prev_session.reported)
-        {
-            bool should_merge = false;
-
-            if (prev_session.end_time_unix == 0)
-            {
-                // Previous session has unknown end time - merge
-                should_merge = true;
-                log_printf("[SESSION] Will merge with previous session (previous end time unknown)\n");
-            }
-            else if (session.session_start_time_unix >= prev_session.end_time_unix)
-            {
-                uint32_t gap_seconds = session.session_start_time_unix - prev_session.end_time_unix;
-                if (gap_seconds <= 900)
-                {
-                    should_merge = true;
-                    log_printf("[SESSION] Will merge with previous session (gap %lu sec <= 15 min)\n", gap_seconds);
-                }
-                else
-                {
-                    log_printf("[SESSION] Will NOT merge with previous session (gap %lu sec > 15 min)\n", gap_seconds);
-                }
-            }
-
-            if (should_merge)
-            {
-                // Merge now so display shows correct values immediately
-                session.current_session_id = prev_session.session_id;
-                session.session_id_decided = true;
-                merge_with_previous_session();
-                log_printf("[SESSION] Merged! Session ID: %lu, rotations: %lu, time: %lu sec\n",
-                       session.current_session_id, counts.session_rotations, counts.session_active_seconds);
-            }
-        }
     }
     else
     {
@@ -1091,28 +894,6 @@ uint32_t odometer_get_current_session_id(void)
 bool odometer_is_session_id_decided(void)
 {
     return session.session_id_decided;
-}
-
-// Get boot-time rotation count (rotations since this boot only, excludes merged data)
-uint32_t odometer_get_boot_rotation_count(void)
-{
-    return counts.boot_rotations;
-}
-
-// Get boot-time active seconds (active time since this boot only, excludes merged data)
-uint32_t odometer_get_boot_active_time_seconds(void)
-{
-    uint32_t total = counts.boot_active_seconds;
-
-    // If currently active, add the time elapsed in the current active period
-    if (counts.is_active)
-    {
-        uint32_t current_time_ms = to_ms_since_boot(get_absolute_time());
-        uint32_t current_period_seconds = (current_time_ms - counts.active_start_time_ms) / 1000;
-        total += current_period_seconds;
-    }
-
-    return total;
 }
 
 // Set lifetime totals (for transferring progress to a new device)

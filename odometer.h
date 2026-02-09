@@ -25,13 +25,13 @@ bool odometer_process(void);
 // Get the total number of rotations (all-time)
 uint32_t odometer_get_count(void);
 
-// Get the current session rotation count (may include merged sessions within 15 min)
+// Get the current session rotation count
 uint32_t odometer_get_session_count(void);
 
 // Get the total active time in seconds (all-time)
 uint32_t odometer_get_active_time_seconds(void);
 
-// Get the current session active time in seconds (may include merged sessions within 15 min)
+// Get the current session active time in seconds
 uint32_t odometer_get_session_active_time_seconds(void);
 
 // Save current count and active time to flash
@@ -85,13 +85,7 @@ uint32_t odometer_get_current_session_id(void);
 // Check if session ID has been decided
 bool odometer_is_session_id_decided(void);
 
-// Get boot-time rotation count (rotations since this boot only, excludes merged data)
-uint32_t odometer_get_boot_rotation_count(void);
-
-// Get boot-time active seconds (active time since this boot only, excludes merged data)
-uint32_t odometer_get_boot_active_time_seconds(void);
-
-// Reset the speed calculation window (called when boot rotations are reset)
+// Reset the speed calculation window (called when starting a new session)
 void odometer_reset_speed_window(void);
 
 // Set lifetime totals (for transferring progress to a new device)

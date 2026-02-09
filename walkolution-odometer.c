@@ -547,18 +547,18 @@ void start_ble_advertising(void)
     log_printf("BLE advertising started\n");
 }
 
-// Reset speed window (called when boot rotations are reset)
+// Reset speed window (called when starting a new session)
 void odometer_reset_speed_window(void)
 {
     memset(&speed_window, 0, sizeof(speed_window));
-    log_printf("[SPEED] Speed window reset (boot rotations were reset)\n");
+    log_printf("[SPEED] Speed window reset (starting new session)\n");
 }
 
 // Update speed window with new rotation
 void update_speed_window(uint32_t current_time_ms)
 {
-    // Use boot rotations (not session rotations) to avoid speed spikes when sessions merge
-    uint32_t current_rotations = odometer_get_boot_rotation_count();
+    // Use session rotations for speed calculation
+    uint32_t current_rotations = odometer_get_session_count();
 
     speed_window.rotations[speed_window.index] = current_rotations;
     speed_window.timestamps_ms[speed_window.index] = current_time_ms;
