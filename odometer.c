@@ -3,11 +3,11 @@
  */
 
 #include "odometer.h"
+#include "flash.h"
 #include "logging.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/flash.h"
-#include "hardware/sync.h"
 #include "hardware/adc.h"
 #include <string.h>
 #include <stdio.h>
@@ -17,28 +17,6 @@
 #define FLASH_SAVE_INTERVAL_MS 60000 // Don't save more than once per minute
 #define ROTATION_SAVE_INTERVAL 2500  // Save every 2500 rotations (~0.5 miles)
 #define TIME_SYNC_TIMEOUT_MS 60000   // Wait up to 60 seconds for time sync before allowing saves
-
-// Flash storage configuration - wear leveling with 64 sectors
-#define FLASH_SECTOR_COUNT 64
-#define FLASH_START_OFFSET (PICO_FLASH_SIZE_BYTES - (FLASH_SECTOR_SIZE * FLASH_SECTOR_COUNT))
-#define FLASH_MAGIC_NUMBER 0x4F444F53 // "ODOS" in hex (Odometer Session)
-#define FLASH_STRUCT_VERSION 1         // Current struct version (increment when changing flash_data_t)
-
-// Flash storage structure - session-based
-typedef struct
-{
-    uint32_t magic;                       // 0x4F444F53 ("ODOS")
-    uint32_t struct_version;              // FLASH_STRUCT_VERSION (currently 1)
-    uint32_t session_id;                  // Monotonically increasing session counter
-    uint32_t session_rotation_count;      // Rotations in this session
-    uint32_t session_active_time_seconds; // Active time in this session (seconds)
-    uint32_t session_start_time_unix;     // Unix timestamp when session started (0 = unknown)
-    uint32_t session_end_time_unix;       // Unix timestamp when session ended (0 = unknown)
-    uint32_t lifetime_rotation_count;     // All-time total rotations
-    uint32_t lifetime_time_seconds;       // All-time total active seconds
-    uint8_t reported;                     // 0 = not reported to fitness app, 1 = reported
-    uint32_t checksum;                    // XOR checksum of all fields above
-} flash_data_t;
 
 // Organized state structures
 typedef struct
@@ -90,142 +68,6 @@ static save_state_t save_state = {0};
 
 // Track the highest session ID seen (for creating new sessions)
 static uint32_t last_session_id = 0;
-
-static uint32_t calculate_checksum(const flash_data_t *data)
-{
-    // XOR of all fields except checksum
-    return data->magic ^
-           data->struct_version ^
-           data->session_id ^
-           data->session_rotation_count ^
-           data->session_active_time_seconds ^
-           data->session_start_time_unix ^
-           data->session_end_time_unix ^
-           data->lifetime_rotation_count ^
-           data->lifetime_time_seconds ^
-           data->reported;
-}
-
-// Write data to flash with automatic verification and retry
-// Handles erase, program, verify, and retry logic
-// Returns true if write succeeded and verified, false otherwise
-static bool write_flash_and_verify(uint32_t sector_offset, const uint8_t *write_buffer, const char *operation_title)
-{
-    const flash_data_t *expected = (const flash_data_t *)write_buffer;
-    const flash_data_t *flash_data;
-    bool verification_passed = false;
-    uint32_t target_sector = (sector_offset - FLASH_START_OFFSET) / FLASH_SECTOR_SIZE;
-
-    // Log all data being written to flash BEFORE writing
-    log_printf("========================================\n");
-    log_printf("[FLASH WRITE] %s:\n", operation_title);
-    log_printf("  Sector: %lu (offset 0x%08lX)\n", target_sector, sector_offset);
-    log_printf("  Magic: 0x%08lX\n", expected->magic);
-    log_printf("  Struct Version: %lu\n", expected->struct_version);
-    log_printf("  Session ID: %lu\n", expected->session_id);
-    log_printf("  Session Rotations: %lu\n", expected->session_rotation_count);
-    log_printf("  Session Active Time: %lu seconds\n", expected->session_active_time_seconds);
-    log_printf("  Session Start Time: %lu\n", expected->session_start_time_unix);
-    log_printf("  Session End Time: %lu\n", expected->session_end_time_unix);
-    log_printf("  Lifetime Rotations: %lu\n", expected->lifetime_rotation_count);
-    log_printf("  Lifetime Time: %lu seconds\n", expected->lifetime_time_seconds);
-    log_printf("  Reported: %u%s\n", expected->reported, expected->reported ? " (CHANGED TO 1)" : "");
-    log_printf("  Checksum: 0x%08lX\n", expected->checksum);
-    log_printf("========================================\n");
-
-    // Try write + verify up to 2 times (initial + 1 retry)
-    for (int attempt = 0; attempt < 2; attempt++) {
-        if (attempt > 0) {
-            log_printf("[FLASH VERIFY] Retrying flash write (attempt %d/2)...\n", attempt + 1);
-        }
-
-        // Erase and program the flash sector
-        uint32_t ints = save_and_disable_interrupts();
-        flash_range_erase(sector_offset, FLASH_SECTOR_SIZE);
-        flash_range_program(sector_offset, write_buffer, FLASH_PAGE_SIZE);
-        restore_interrupts(ints);
-
-        // Now verify what we just wrote
-        flash_data = (const flash_data_t *)(XIP_BASE + sector_offset);
-        verification_passed = true; // Assume success until we find a problem
-
-        // Verify magic number
-        if (flash_data->magic != expected->magic) {
-            log_printf("[FLASH VERIFY] ERROR: Magic mismatch! Expected 0x%08lX, got 0x%08lX\n",
-                       expected->magic, flash_data->magic);
-            verification_passed = false;
-        }
-
-        // Verify checksum
-        else if (flash_data->checksum != expected->checksum) {
-            log_printf("[FLASH VERIFY] ERROR: Checksum mismatch! Expected 0x%08lX, got 0x%08lX\n",
-                       expected->checksum, flash_data->checksum);
-            verification_passed = false;
-        }
-
-        // Verify checksum is valid
-        else {
-            uint32_t calculated_checksum = calculate_checksum(flash_data);
-            if (flash_data->checksum != calculated_checksum) {
-                log_printf("[FLASH VERIFY] ERROR: Checksum invalid! Stored 0x%08lX, calculated 0x%08lX\n",
-                           flash_data->checksum, calculated_checksum);
-                verification_passed = false;
-            }
-        }
-
-        // Verify all fields match
-        if (verification_passed &&
-            (flash_data->struct_version != expected->struct_version ||
-             flash_data->session_id != expected->session_id ||
-             flash_data->session_rotation_count != expected->session_rotation_count ||
-             flash_data->session_active_time_seconds != expected->session_active_time_seconds ||
-             flash_data->session_start_time_unix != expected->session_start_time_unix ||
-             flash_data->session_end_time_unix != expected->session_end_time_unix ||
-             flash_data->lifetime_rotation_count != expected->lifetime_rotation_count ||
-             flash_data->lifetime_time_seconds != expected->lifetime_time_seconds ||
-             flash_data->reported != expected->reported)) {
-
-            log_printf("[FLASH VERIFY] ERROR: Field mismatch detected:\n");
-            if (flash_data->struct_version != expected->struct_version)
-                log_printf("  - struct_version: expected %lu, got %lu\n", expected->struct_version, flash_data->struct_version);
-            if (flash_data->session_id != expected->session_id)
-                log_printf("  - session_id: expected %lu, got %lu\n", expected->session_id, flash_data->session_id);
-            if (flash_data->session_rotation_count != expected->session_rotation_count)
-                log_printf("  - session_rotation_count: expected %lu, got %lu\n", expected->session_rotation_count, flash_data->session_rotation_count);
-            if (flash_data->session_active_time_seconds != expected->session_active_time_seconds)
-                log_printf("  - session_active_time_seconds: expected %lu, got %lu\n", expected->session_active_time_seconds, flash_data->session_active_time_seconds);
-            if (flash_data->session_start_time_unix != expected->session_start_time_unix)
-                log_printf("  - session_start_time_unix: expected %lu, got %lu\n", expected->session_start_time_unix, flash_data->session_start_time_unix);
-            if (flash_data->session_end_time_unix != expected->session_end_time_unix)
-                log_printf("  - session_end_time_unix: expected %lu, got %lu\n", expected->session_end_time_unix, flash_data->session_end_time_unix);
-            if (flash_data->lifetime_rotation_count != expected->lifetime_rotation_count)
-                log_printf("  - lifetime_rotation_count: expected %lu, got %lu\n", expected->lifetime_rotation_count, flash_data->lifetime_rotation_count);
-            if (flash_data->lifetime_time_seconds != expected->lifetime_time_seconds)
-                log_printf("  - lifetime_time_seconds: expected %lu, got %lu\n", expected->lifetime_time_seconds, flash_data->lifetime_time_seconds);
-            if (flash_data->reported != expected->reported)
-                log_printf("  - reported: expected %u, got %u\n", expected->reported, flash_data->reported);
-
-            verification_passed = false;
-        }
-
-        // If verification passed, we're done
-        if (verification_passed) {
-            if (attempt > 0) {
-                log_printf("[FLASH VERIFY] ✓ Flash write verified successfully after retry\n");
-            } else {
-                log_printf("[FLASH VERIFY] ✓ Flash write verified successfully\n");
-            }
-            return true;
-        }
-
-        // If this was our last attempt, log final failure
-        if (attempt == 1) {
-            log_printf("[FLASH VERIFY] ERROR: Flash write verification failed after retry!\n");
-        }
-    }
-
-    return false;
-}
 
 // Read VSYS voltage in millivolts
 uint16_t odometer_read_voltage(void)
@@ -295,11 +137,11 @@ static bool load_count_from_flash(void)
 {
     uint32_t max_session_id = 0;
     bool found_valid = false;
-    const flash_data_t *latest_data = NULL;
+    session_data_t latest_data;
 
     // Array to store valid sessions for logging (up to 64)
     typedef struct {
-        const flash_data_t *data;
+        session_data_t data;
         uint32_t sector;
     } valid_session_t;
     valid_session_t valid_sessions[FLASH_SECTOR_COUNT];
@@ -308,33 +150,24 @@ static bool load_count_from_flash(void)
     // Scan all 64 sectors to find the one with the highest valid session_id
     for (uint32_t sector = 0; sector < FLASH_SECTOR_COUNT; sector++)
     {
-        uint32_t sector_offset = FLASH_START_OFFSET + (sector * FLASH_SECTOR_SIZE);
-        const flash_data_t *flash_data = (const flash_data_t *)(XIP_BASE + sector_offset);
+        session_data_t session_data;
 
-        // Verify magic number, struct version, and checksum
-        if (flash_data->magic == FLASH_MAGIC_NUMBER &&
-            flash_data->struct_version <= FLASH_STRUCT_VERSION &&
-            flash_data->checksum == calculate_checksum(flash_data))
+        // Try to read and verify data using flash module
+        // flash_read will automatically erase sectors with newer struct versions
+        if (flash_read(sector, &session_data))
         {
             // Store this valid session for logging
-            valid_sessions[valid_count].data = flash_data;
+            valid_sessions[valid_count].data = session_data;
             valid_sessions[valid_count].sector = sector;
             valid_count++;
 
             // Check if this is the newest valid entry (highest session_id)
-            if (!found_valid || flash_data->session_id > max_session_id)
+            if (!found_valid || session_data.session_id > max_session_id)
             {
-                max_session_id = flash_data->session_id;
-                latest_data = flash_data;
+                max_session_id = session_data.session_id;
+                latest_data = session_data;
                 found_valid = true;
             }
-        }
-        else if (flash_data->magic == FLASH_MAGIC_NUMBER &&
-                 flash_data->struct_version > FLASH_STRUCT_VERSION)
-        {
-            // Found a session from newer code - log warning
-            log_printf("[FLASH] WARNING: Sector %lu has struct_version %lu (current is %u) - ignoring (newer code)\n",
-                       sector, flash_data->struct_version, FLASH_STRUCT_VERSION);
         }
     }
 
@@ -349,7 +182,7 @@ static bool load_count_from_flash(void)
         {
             for (uint32_t j = 0; j < valid_count - i - 1; j++)
             {
-                if (valid_sessions[j].data->session_id < valid_sessions[j + 1].data->session_id)
+                if (valid_sessions[j].data.session_id < valid_sessions[j + 1].data.session_id)
                 {
                     valid_session_t temp = valid_sessions[j];
                     valid_sessions[j] = valid_sessions[j + 1];
@@ -362,7 +195,7 @@ static bool load_count_from_flash(void)
         uint32_t log_count = (valid_count > 10) ? 10 : valid_count;
         for (uint32_t i = 0; i < log_count; i++)
         {
-            const flash_data_t *d = valid_sessions[i].data;
+            const session_data_t *d = &valid_sessions[i].data;
             log_printf("[FLASH]   [%lu] Sector %lu: ID=%lu, Rotations=%lu/%lu, Time=%lu/%lu sec, Start=%lu, End=%lu, Reported=%s\n",
                        i + 1,
                        valid_sessions[i].sector,
@@ -380,11 +213,11 @@ static bool load_count_from_flash(void)
     if (found_valid)
     {
         // Load lifetime totals from the most recent session
-        counts.lifetime_rotations = latest_data->lifetime_rotation_count;
-        counts.lifetime_active_seconds = latest_data->lifetime_time_seconds;
+        counts.lifetime_rotations = latest_data.lifetime_rotation_count;
+        counts.lifetime_active_seconds = latest_data.lifetime_time_seconds;
 
         // Store the highest session ID we've seen
-        last_session_id = latest_data->session_id;
+        last_session_id = latest_data.session_id;
 
         // Start fresh for this session
         counts.session_rotations = 0;
@@ -477,28 +310,23 @@ void odometer_save_count(void)
     }
 
     // Calculate which sector to write to
-    uint32_t target_sector = target_session_id % FLASH_SECTOR_COUNT;
-    uint32_t sector_offset = FLASH_START_OFFSET + (target_sector * FLASH_SECTOR_SIZE);
+    uint32_t sector_index = target_session_id % FLASH_SECTOR_COUNT;
 
-    // Prepare data structure
-    static uint8_t __attribute__((aligned(FLASH_PAGE_SIZE))) write_buffer[FLASH_PAGE_SIZE];
-    flash_data_t *data = (flash_data_t *)write_buffer;
-    memset(write_buffer, 0, FLASH_PAGE_SIZE);
+    // Prepare session data structure (no internal flash fields needed)
+    session_data_t data;
+    memset(&data, 0, sizeof(session_data_t));
 
-    data->magic = FLASH_MAGIC_NUMBER;
-    data->struct_version = FLASH_STRUCT_VERSION;
-    data->session_id = target_session_id;
-    data->session_rotation_count = counts.session_rotations;
-    data->session_active_time_seconds = odometer_get_session_active_time_seconds();
-    data->session_start_time_unix = session.session_start_time_unix;
-    data->session_end_time_unix = session_end_time;
-    data->lifetime_rotation_count = counts.lifetime_rotations;
-    data->lifetime_time_seconds = odometer_get_active_time_seconds();
-    data->reported = 0; // New/updated sessions are not reported
-    data->checksum = calculate_checksum(data);
+    data.session_id = target_session_id;
+    data.session_rotation_count = counts.session_rotations;
+    data.session_active_time_seconds = odometer_get_session_active_time_seconds();
+    data.session_start_time_unix = session.session_start_time_unix;
+    data.session_end_time_unix = session_end_time;
+    data.lifetime_rotation_count = counts.lifetime_rotations;
+    data.lifetime_time_seconds = odometer_get_active_time_seconds();
+    data.reported = 0; // New/updated sessions are not reported
 
     // Write to flash with verification and automatic retry
-    if (!write_flash_and_verify(sector_offset, write_buffer, "Writing session to flash")) {
+    if (!flash_write(sector_index, &data, "Writing session to flash")) {
         log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
         log_printf("[FLASH WRITE] Data integrity cannot be guaranteed. System may need attention.\n");
         // Continue anyway - we've already written the data, and there's not much we can do at this point
@@ -710,27 +538,23 @@ uint32_t odometer_get_unreported_sessions(session_record_t *sessions, uint32_t m
     // Scan all 64 sectors for unreported sessions
     for (uint32_t sector = 0; sector < FLASH_SECTOR_COUNT && count < max_sessions; sector++)
     {
-        uint32_t sector_offset = FLASH_START_OFFSET + (sector * FLASH_SECTOR_SIZE);
-        const flash_data_t *flash_data = (const flash_data_t *)(XIP_BASE + sector_offset);
+        session_data_t session_data;
 
-        // Verify magic number, struct version, and checksum
-        if (flash_data->magic == FLASH_MAGIC_NUMBER &&
-            flash_data->struct_version <= FLASH_STRUCT_VERSION &&
-            flash_data->checksum == calculate_checksum(flash_data) &&
-            flash_data->reported == 0) // Only unreported sessions
+        // Verify data is valid and unreported using flash module
+        if (flash_read(sector, &session_data) && session_data.reported == 0)
         {
             // Skip the excluded session
-            if (exclude_session_id != 0 && flash_data->session_id == exclude_session_id)
+            if (exclude_session_id != 0 && session_data.session_id == exclude_session_id)
             {
                 continue;
             }
 
             // Add this session to the list
-            sessions[count].session_id = flash_data->session_id;
-            sessions[count].rotation_count = flash_data->session_rotation_count;
-            sessions[count].active_time_seconds = flash_data->session_active_time_seconds;
-            sessions[count].start_time_unix = flash_data->session_start_time_unix;
-            sessions[count].end_time_unix = flash_data->session_end_time_unix;
+            sessions[count].session_id = session_data.session_id;
+            sessions[count].rotation_count = session_data.session_rotation_count;
+            sessions[count].active_time_seconds = session_data.session_active_time_seconds;
+            sessions[count].start_time_unix = session_data.session_start_time_unix;
+            sessions[count].end_time_unix = session_data.session_end_time_unix;
             count++;
         }
     }
@@ -754,22 +578,14 @@ bool odometer_mark_session_reported(uint32_t session_id)
         // Now mark it as reported in flash
         for (uint32_t sector = 0; sector < FLASH_SECTOR_COUNT; sector++)
         {
-            uint32_t sector_offset = FLASH_START_OFFSET + (sector * FLASH_SECTOR_SIZE);
-            const flash_data_t *flash_data = (const flash_data_t *)(XIP_BASE + sector_offset);
+            session_data_t data;
 
-            if (flash_data->magic == FLASH_MAGIC_NUMBER &&
-                flash_data->struct_version <= FLASH_STRUCT_VERSION &&
-                flash_data->checksum == calculate_checksum(flash_data) &&
-                flash_data->session_id == session_id)
+            if (flash_read(sector, &data) && data.session_id == session_id)
             {
-                static uint8_t __attribute__((aligned(FLASH_PAGE_SIZE))) write_buffer[FLASH_PAGE_SIZE];
-                flash_data_t *data = (flash_data_t *)write_buffer;
-                memcpy(write_buffer, (const void *)flash_data, sizeof(flash_data_t));
-                data->reported = 1;
-                data->checksum = calculate_checksum(data);
+                data.reported = 1;
 
                 // Write to flash with verification and automatic retry
-                if (!write_flash_and_verify(sector_offset, write_buffer, "Marking session as REPORTED")) {
+                if (!flash_write(sector, &data, "Marking session as REPORTED")) {
                     log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
                     log_printf("[FLASH WRITE] Session %lu may not be properly marked as reported.\n", session_id);
                 }
@@ -810,30 +626,16 @@ bool odometer_mark_session_reported(uint32_t session_id)
     // Normal case: find the session in flash and mark it as reported
     for (uint32_t sector = 0; sector < FLASH_SECTOR_COUNT; sector++)
     {
-        uint32_t sector_offset = FLASH_START_OFFSET + (sector * FLASH_SECTOR_SIZE);
-        const flash_data_t *flash_data = (const flash_data_t *)(XIP_BASE + sector_offset);
+        session_data_t data;
 
         // Check if this is the session we're looking for
-        if (flash_data->magic == FLASH_MAGIC_NUMBER &&
-            flash_data->struct_version <= FLASH_STRUCT_VERSION &&
-            flash_data->checksum == calculate_checksum(flash_data) &&
-            flash_data->session_id == session_id)
+        if (flash_read(sector, &data) && data.session_id == session_id)
         {
             // Found it! Update the reported flag
-            static uint8_t __attribute__((aligned(FLASH_PAGE_SIZE))) write_buffer[FLASH_PAGE_SIZE];
-            flash_data_t *data = (flash_data_t *)write_buffer;
-
-            // Copy existing data
-            memcpy(write_buffer, (const void *)flash_data, sizeof(flash_data_t));
-
-            // Update reported flag
-            data->reported = 1;
-
-            // Recalculate checksum
-            data->checksum = calculate_checksum(data);
+            data.reported = 1;
 
             // Write to flash with verification and automatic retry
-            if (!write_flash_and_verify(sector_offset, write_buffer, "Marking OLD session as REPORTED")) {
+            if (!flash_write(sector, &data, "Marking OLD session as REPORTED")) {
                 log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
                 log_printf("[FLASH WRITE] Session %lu may not be properly marked as reported.\n", session_id);
             }

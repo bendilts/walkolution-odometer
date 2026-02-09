@@ -38,6 +38,7 @@ pico_sdk_init()
 add_executable(walkolution-odometer
     walkolution-odometer.c
     odometer.c
+    flash.c
     oled.c
     adafruit_fonts.c
     icons.c
