@@ -372,6 +372,11 @@ static hci_con_handle_t connection_handle;
 // Note: odometer_characteristic_handle is defined in the generated header as:
 // ATT_CHARACTERISTIC_12345678_1234_5678_1234_56789ABCDEF1_01_VALUE_HANDLE
 
+// BLE activation delay tracking (requires voltage to be stable for 15 seconds)
+#define BLE_ACTIVATION_DELAY_MS 15000  // 15 seconds
+static uint32_t ble_voltage_above_threshold_start_ms = 0;  // When voltage first went above threshold
+static bool ble_voltage_is_above_threshold = false;        // Current voltage state
+
 // Connection status is now integrated into update_oled_session() and update_oled_totals()
 
 // Speed calculation
@@ -1015,16 +1020,53 @@ int main()
                 }
             }
 
-            // Start BLE advertising based on voltage (only check for starting, never stop once started)
-            if (voltage_mv >= BLE_VOLTAGE_THRESHOLD_MV && !ble_advertising)
+            // Track voltage state for BLE activation delay
+            // Voltage must stay above threshold for BLE_ACTIVATION_DELAY_MS before starting BLE
+            if (voltage_mv >= BLE_VOLTAGE_THRESHOLD_MV)
             {
-                log_printf("*** STARTING BLE ADVERTISING (voltage %u >= %u) ***\n",
-                           voltage_mv, BLE_VOLTAGE_THRESHOLD_MV);
-                start_ble_advertising();
+                // Voltage is above threshold
+                if (!ble_voltage_is_above_threshold)
+                {
+                    // Voltage just went above threshold - start the timer
+                    ble_voltage_is_above_threshold = true;
+                    ble_voltage_above_threshold_start_ms = current_time_ms;
+                    log_printf("Voltage above BLE threshold (%u >= %u), starting %d second delay timer\n",
+                               voltage_mv, BLE_VOLTAGE_THRESHOLD_MV, BLE_ACTIVATION_DELAY_MS / 1000);
+                }
+                else if (!ble_advertising)
+                {
+                    // Check if we've been above threshold long enough
+                    uint32_t time_above_threshold_ms = current_time_ms - ble_voltage_above_threshold_start_ms;
+                    if (time_above_threshold_ms >= BLE_ACTIVATION_DELAY_MS)
+                    {
+                        log_printf("*** STARTING BLE ADVERTISING (voltage stable at %u mV for %lu ms) ***\n",
+                                   voltage_mv, time_above_threshold_ms);
+                        start_ble_advertising();
+                    }
+                    else
+                    {
+                        // Still waiting for the delay to complete
+                        uint32_t remaining_ms = BLE_ACTIVATION_DELAY_MS - time_above_threshold_ms;
+                        log_printf("Voltage stable above threshold for %lu ms, %lu ms remaining before BLE starts\n",
+                                   time_above_threshold_ms, remaining_ms);
+                    }
+                }
             }
-            else if (voltage_mv < BLE_VOLTAGE_THRESHOLD_MV && !ble_advertising)
+            else
             {
-                log_printf("Voltage too low for BLE: %u < %u\n", voltage_mv, BLE_VOLTAGE_THRESHOLD_MV);
+                // Voltage is below threshold
+                if (ble_voltage_is_above_threshold)
+                {
+                    // Voltage dropped below threshold - reset the timer
+                    ble_voltage_is_above_threshold = false;
+                    ble_voltage_above_threshold_start_ms = 0;
+                    log_printf("Voltage dropped below BLE threshold (%u < %u), resetting delay timer\n",
+                               voltage_mv, BLE_VOLTAGE_THRESHOLD_MV);
+                }
+                else if (!ble_advertising)
+                {
+                    log_printf("Voltage too low for BLE: %u < %u\n", voltage_mv, BLE_VOLTAGE_THRESHOLD_MV);
+                }
             }
 
             last_voltage_check_ms = current_time_ms;
