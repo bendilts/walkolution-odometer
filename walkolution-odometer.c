@@ -913,7 +913,7 @@ int main()
     log_printf("Initializing user settings...\n");
     user_settings_init();
 
-    // Initialize OLED display (starts rendering thread on core 1)
+    // Initialize OLED display
     log_printf("Initializing OLED display...\n");
     oled_init(OLED_I2C_PORT, OLED_SDA_PIN, OLED_SCL_PIN, OLED_ADDR);
 

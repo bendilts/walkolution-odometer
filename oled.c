@@ -3,17 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
-#include "pico/multicore.h"
-#include "pico/mutex.h"
 #include "hardware/i2c.h"
 
-// Display buffer (double buffered for thread safety)
+// Display buffer
 static uint8_t oled_buffer[OLED_WIDTH * OLED_HEIGHT / 8];
-static uint8_t oled_render_buffer[OLED_WIDTH * OLED_HEIGHT / 8];
-
-// Thread synchronization
-static mutex_t buffer_mutex;
-static volatile bool update_in_progress = false;
 
 // Hardware configuration
 static i2c_inst_t* i2c_port;
@@ -59,7 +52,7 @@ static void oled_hw_init(void) {
     oled_send_cmd(0xAF); // Display on
 }
 
-// Send buffer to display (called from core 1)
+// Send buffer to display
 static void oled_render(void) {
     for (int page = 0; page < 8; page++) {
         oled_send_cmd(0xB0 + page); // Set page address
@@ -67,41 +60,8 @@ static void oled_render(void) {
         oled_send_cmd(0x10); // Set higher column address
 
         for (int x = 0; x < OLED_WIDTH; x++) {
-            oled_send_data(oled_render_buffer[x + page * OLED_WIDTH]);
+            oled_send_data(oled_buffer[x + page * OLED_WIDTH]);
         }
-    }
-}
-
-// Core 1 entry point - rendering thread
-static void core1_entry(void) {
-    while (true) {
-        // Wait for signal from core 0 (blocks efficiently, no busy-wait)
-        multicore_fifo_pop_blocking();
-
-        // Mark as in progress immediately
-        update_in_progress = true;
-
-        // Drain FIFO - if multiple frames queued, skip to latest
-        uint32_t skipped_frames = 0;
-        while (multicore_fifo_rvalid()) {
-            multicore_fifo_pop_blocking();
-            skipped_frames++;
-        }
-
-        if (skipped_frames > 0) {
-            log_printf("[OLED Core 1] Skipped %lu frame%s (can't keep up)\n",
-                   skipped_frames, skipped_frames == 1 ? "" : "s");
-        }
-
-        // Copy working buffer to render buffer (minimize mutex hold time)
-        mutex_enter_blocking(&buffer_mutex);
-        memcpy(oled_render_buffer, oled_buffer, sizeof(oled_buffer));
-        mutex_exit(&buffer_mutex);
-
-        // Send to display (slow I2C operation, no mutex held)
-        oled_render();
-
-        update_in_progress = false;
     }
 }
 
@@ -118,25 +78,16 @@ void oled_init(void* i2c_inst, uint8_t sda_pin, uint8_t scl_pin, uint8_t addr) {
     gpio_set_pulls(sda_pin, true, false);
     gpio_set_pulls(scl_pin, true, false);
 
-    // Initialize mutex
-    mutex_init(&buffer_mutex);
-
-    // Clear buffers
+    // Clear buffer
     memset(oled_buffer, 0, sizeof(oled_buffer));
-    memset(oled_render_buffer, 0, sizeof(oled_render_buffer));
 
     // Initialize hardware
     sleep_ms(100);
     oled_hw_init();
-
-    // Launch rendering thread on core 1
-    multicore_launch_core1(core1_entry);
 }
 
 void oled_clear(void) {
-    mutex_enter_blocking(&buffer_mutex);
     memset(oled_buffer, 0, sizeof(oled_buffer));
-    mutex_exit(&buffer_mutex);
 }
 
 void oled_set_pixel(int x, int y, bool on) {
@@ -144,18 +95,14 @@ void oled_set_pixel(int x, int y, bool on) {
         return;
     }
 
-    mutex_enter_blocking(&buffer_mutex);
     if (on) {
         oled_buffer[x + (y / 8) * OLED_WIDTH] |= (1 << (y & 7));
     } else {
         oled_buffer[x + (y / 8) * OLED_WIDTH] &= ~(1 << (y & 7));
     }
-    mutex_exit(&buffer_mutex);
 }
 
 void oled_fill_circle(int x0, int y0, int radius) {
-    mutex_enter_blocking(&buffer_mutex);
-
     // Bresenham-based scanline algorithm - only iterate actual pixels
     int radius_sq = radius * radius;
 
@@ -191,20 +138,15 @@ void oled_fill_circle(int x0, int y0, int radius) {
             oled_buffer[px + byte_offset] |= bit_mask;
         }
     }
-
-    mutex_exit(&buffer_mutex);
 }
 
 void oled_fill_rect(int x, int y, int width, int height, bool on) {
-    mutex_enter_blocking(&buffer_mutex);
-
     // Clip to screen bounds
     if (x < 0) { width += x; x = 0; }
     if (y < 0) { height += y; y = 0; }
     if (x + width > OLED_WIDTH) width = OLED_WIDTH - x;
     if (y + height > OLED_HEIGHT) height = OLED_HEIGHT - y;
     if (width <= 0 || height <= 0) {
-        mutex_exit(&buffer_mutex);
         return;
     }
 
@@ -244,14 +186,10 @@ void oled_fill_rect(int x, int y, int width, int height, bool on) {
             }
         }
     }
-
-    mutex_exit(&buffer_mutex);
 }
 
 void oled_draw_text(int x, int y, const char *text, const GFXfont *font) {
     if (!text || !font) return;
-
-    mutex_enter_blocking(&buffer_mutex);
 
     int cursor_x = x;
 
@@ -314,8 +252,6 @@ void oled_draw_text(int x, int y, const char *text, const GFXfont *font) {
 
         cursor_x += glyph->x_advance;
     }
-
-    mutex_exit(&buffer_mutex);
 }
 
 void oled_draw_text_centered(int center_x, int y, const char *text, const GFXfont *font) {
@@ -333,20 +269,12 @@ void oled_draw_text_centered(int center_x, int y, const char *text, const GFXfon
 }
 
 void oled_update(void) {
-    // Only signal if core 1 isn't already rendering (skip frames if behind)
-    if (!update_in_progress) {
-        // Try to push without blocking - if FIFO is full, skip this frame
-        if (multicore_fifo_wready()) {
-            multicore_fifo_push_blocking(1);
-        }
-    }
+    // Send buffer to display immediately
+    oled_render();
 }
 
 void oled_wait_for_update(void) {
-    // Wait for any pending update to complete
-    while (update_in_progress) {
-        tight_loop_contents();
-    }
+    // No-op - updates are now synchronous
 }
 
 void oled_measure_text(const char *text, const GFXfont *font, int *width, int *ascent, int *descent) {
@@ -399,8 +327,6 @@ void oled_measure_text(const char *text, const GFXfont *font, int *width, int *a
 void oled_draw_bitmap(int x, int y, const uint8_t *bitmap, int width, int height) {
     if (!bitmap || width <= 0 || height <= 0) return;
 
-    mutex_enter_blocking(&buffer_mutex);
-
     // Calculate bytes per row (round up to nearest byte)
     int bytes_per_row = (width + 7) / 8;
 
@@ -430,8 +356,6 @@ void oled_draw_bitmap(int x, int y, const uint8_t *bitmap, int width, int height
             }
         }
     }
-
-    mutex_exit(&buffer_mutex);
 }
 
 void oled_display_on(void) {

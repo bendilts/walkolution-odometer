@@ -56,7 +56,6 @@ target_link_libraries(walkolution-odometer
     hardware_sync
     hardware_i2c
     hardware_adc
-    pico_multicore
 )
 
 if (PICO_CYW43_SUPPORTED)

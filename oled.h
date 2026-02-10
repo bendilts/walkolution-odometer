@@ -9,7 +9,7 @@
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 
-// Initialize OLED module and start rendering thread on core 1
+// Initialize OLED module
 // i2c_port: The I2C instance to use (i2c0 or i2c1)
 // sda_pin: GPIO pin for SDA
 // scl_pin: GPIO pin for SCL
@@ -19,13 +19,13 @@ void oled_init(void* i2c_port, uint8_t sda_pin, uint8_t scl_pin, uint8_t addr);
 // Clear the entire display buffer
 void oled_clear(void);
 
-// Set a single pixel (thread-safe)
+// Set a single pixel
 void oled_set_pixel(int x, int y, bool on);
 
-// Draw a filled circle (thread-safe)
+// Draw a filled circle
 void oled_fill_circle(int x0, int y0, int radius);
 
-// Draw a filled rectangle (thread-safe, highly optimized)
+// Draw a filled rectangle (highly optimized)
 // x, y: top-left corner
 // width, height: dimensions
 // on: true to fill, false to clear
@@ -59,10 +59,10 @@ void oled_measure_text(const char *text, const GFXfont *font, int *width, int *a
 // Bitmap format: MSB first, rows packed into bytes (e.g., 12x12 icon = 12 bytes per row, rounded up)
 void oled_draw_bitmap(int x, int y, const uint8_t *bitmap, int width, int height);
 
-// Request a display update (non-blocking - signals core 1 to send data)
+// Update the display (sends buffer to display)
 void oled_update(void);
 
-// Wait for any pending update to complete (optional, for synchronization)
+// Wait for any pending update to complete (no-op, for backward compatibility)
 void oled_wait_for_update(void);
 
 // Turn OLED display on (wake from sleep)
