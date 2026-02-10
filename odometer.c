@@ -21,23 +21,23 @@
 // Organized state structures
 typedef struct
 {
-    uint32_t lifetime_rotations;           // All-time total rotations
-    uint32_t lifetime_active_seconds;      // All-time total active seconds
-    uint32_t session_rotations;            // Current session rotations
-    uint32_t session_active_seconds;       // Current session active time
-    uint32_t last_rotation_time_ms;        // Time of last rotation
-    uint32_t active_start_time_ms;         // When current active period started
-    bool is_active;                        // Currently counting active time
+    uint32_t lifetime_rotations;      // All-time total rotations
+    uint32_t lifetime_active_seconds; // All-time total active seconds
+    uint32_t session_rotations;       // Current session rotations
+    uint32_t session_active_seconds;  // Current session active time
+    uint32_t last_rotation_time_ms;   // Time of last rotation
+    uint32_t active_start_time_ms;    // When current active period started
+    bool is_active;                   // Currently counting active time
 } odometer_counts_t;
 
 typedef struct
 {
-    uint32_t current_session_id;           // Current session ID (0 until decided)
-    uint32_t session_start_time_unix;      // Unix timestamp when Pico booted (calculated)
-    uint32_t time_reference_unix;          // Reference Unix timestamp from external source
-    uint32_t time_reference_boot_ms;       // Boot time when we got the timestamp
-    bool time_acquired;                    // Whether we've gotten time from any source
-    bool session_id_decided;               // Have we decided our session ID yet?
+    uint32_t current_session_id;      // Current session ID (0 until decided)
+    uint32_t session_start_time_unix; // Unix timestamp when Pico booted (calculated)
+    uint32_t time_reference_unix;     // Reference Unix timestamp from external source
+    uint32_t time_reference_boot_ms;  // Boot time when we got the timestamp
+    bool time_acquired;               // Whether we've gotten time from any source
+    bool session_id_decided;          // Have we decided our session ID yet?
 } session_state_t;
 
 typedef struct
@@ -120,7 +120,7 @@ uint16_t odometer_read_voltage(void)
         if (last_valid_voltage > 0)
         {
             log_printf("WARNING: Invalid voltage reading %lu mV, using cached %u mV\n",
-                   vsys_mv, last_valid_voltage);
+                       vsys_mv, last_valid_voltage);
             return last_valid_voltage;
         }
     }
@@ -140,7 +140,8 @@ static bool load_count_from_flash(void)
     session_data_t latest_data;
 
     // Array to store valid sessions for logging (up to 64)
-    typedef struct {
+    typedef struct
+    {
         session_data_t data;
         uint32_t sector;
     } valid_session_t;
@@ -251,24 +252,6 @@ uint32_t odometer_get_current_unix_time(void)
     return session.time_reference_unix + elapsed_seconds;
 }
 
-// Helper function to check if we're allowed to save to flash
-// We require time to be synced OR 60 seconds to have passed since boot
-static bool can_save_to_flash(void)
-{
-    if (session.time_acquired)
-    {
-        return true; // Time is synced
-    }
-
-    uint32_t current_boot_ms = to_ms_since_boot(get_absolute_time());
-    if (current_boot_ms >= TIME_SYNC_TIMEOUT_MS)
-    {
-        return true; // Timeout reached, time sync probably isn't coming
-    }
-
-    return false; // Still waiting for time sync
-}
-
 void odometer_save_count(void)
 {
     uint32_t current_time_unix = odometer_get_current_unix_time();
@@ -306,7 +289,7 @@ void odometer_save_count(void)
         uint32_t active_seconds = odometer_get_session_active_time_seconds();
         session.session_start_time_unix = session_end_time - active_seconds;
         log_printf("[SESSION] Estimated start time from end time - active seconds: %lu - %lu = %lu\n",
-               session_end_time, active_seconds, session.session_start_time_unix);
+                   session_end_time, active_seconds, session.session_start_time_unix);
     }
 
     // Calculate which sector to write to
@@ -326,7 +309,8 @@ void odometer_save_count(void)
     data.reported = 0; // New/updated sessions are not reported
 
     // Write to flash with verification and automatic retry
-    if (!flash_write(sector_index, &data, "Writing session to flash")) {
+    if (!flash_write(sector_index, &data, "Writing session to flash"))
+    {
         log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
         log_printf("[FLASH WRITE] Data integrity cannot be guaranteed. System may need attention.\n");
         // Continue anyway - we've already written the data, and there's not much we can do at this point
@@ -398,8 +382,7 @@ bool odometer_process(void)
         {
             // Voltage is low - save immediately before potential power loss
             // (only if count has changed and at least 1 minute since last save)
-            if (can_save_to_flash() &&
-                counts.lifetime_rotations != save_state.last_saved_count &&
+            if (counts.lifetime_rotations != save_state.last_saved_count &&
                 (current_time_ms - save_state.last_save_time_ms) >= FLASH_SAVE_INTERVAL_MS)
             {
                 odometer_save_count();
@@ -433,9 +416,7 @@ bool odometer_process(void)
 
             // Check if we should save to flash based on rotation count
             // Save every ROTATION_SAVE_INTERVAL rotations (2500 = ~0.5 miles)
-            // Only save if time is synced (or timeout reached)
-            if (can_save_to_flash() &&
-                (counts.lifetime_rotations - save_state.last_saved_count) >= ROTATION_SAVE_INTERVAL)
+            if ((counts.lifetime_rotations - save_state.last_saved_count) >= ROTATION_SAVE_INTERVAL)
             {
                 odometer_save_count();
             }
@@ -514,9 +495,7 @@ void odometer_add_rotation(void)
     }
 
     // Check if we should save to flash based on rotation count
-    // Only save if time is synced (or timeout reached)
-    if (can_save_to_flash() &&
-        (counts.lifetime_rotations - save_state.last_saved_count) >= ROTATION_SAVE_INTERVAL)
+    if ((counts.lifetime_rotations - save_state.last_saved_count) >= ROTATION_SAVE_INTERVAL)
     {
         odometer_save_count();
     }
@@ -585,7 +564,8 @@ bool odometer_mark_session_reported(uint32_t session_id)
                 data.reported = 1;
 
                 // Write to flash with verification and automatic retry
-                if (!flash_write(sector, &data, "Marking session as REPORTED")) {
+                if (!flash_write(sector, &data, "Marking session as REPORTED"))
+                {
                     log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
                     log_printf("[FLASH WRITE] Session %lu may not be properly marked as reported.\n", session_id);
                 }
@@ -614,7 +594,7 @@ bool odometer_mark_session_reported(uint32_t session_id)
         log_printf("  - Starting fresh session with zero counts\n");
 
         log_printf("  - New session ID: %lu (rotations: %lu)\n",
-               new_session_id, counts.session_rotations);
+                   new_session_id, counts.session_rotations);
 
         // Save the new session to flash immediately (even if empty)
         // This ensures the new session ID is persisted
@@ -635,7 +615,8 @@ bool odometer_mark_session_reported(uint32_t session_id)
             data.reported = 1;
 
             // Write to flash with verification and automatic retry
-            if (!flash_write(sector, &data, "Marking OLD session as REPORTED")) {
+            if (!flash_write(sector, &data, "Marking OLD session as REPORTED"))
+            {
                 log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
                 log_printf("[FLASH WRITE] Session %lu may not be properly marked as reported.\n", session_id);
             }
@@ -713,14 +694,14 @@ void odometer_set_lifetime_totals(float hours, float distance_miles)
     log_printf("  - Hours: %.2f -> %lu seconds\n", hours, seconds);
     log_printf("  - Distance: %.2f miles -> %lu rotations\n", distance_miles, rotations);
     log_printf("  - Previous lifetime: %lu rotations, %lu seconds\n",
-           counts.lifetime_rotations, counts.lifetime_active_seconds);
+               counts.lifetime_rotations, counts.lifetime_active_seconds);
 
     // Update the lifetime totals
     counts.lifetime_rotations = rotations;
     counts.lifetime_active_seconds = seconds;
 
     log_printf("  - New lifetime: %lu rotations, %lu seconds\n",
-           counts.lifetime_rotations, counts.lifetime_active_seconds);
+               counts.lifetime_rotations, counts.lifetime_active_seconds);
 
     // Save to flash immediately
     log_printf("  - Saving to flash...\n");
