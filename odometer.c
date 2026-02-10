@@ -32,12 +32,11 @@ typedef struct
 
 typedef struct
 {
-    uint32_t current_session_id;      // Current session ID (0 until decided)
+    uint32_t current_session_id;      // Current session ID
     uint32_t session_start_time_unix; // Unix timestamp when Pico booted (calculated)
     uint32_t time_reference_unix;     // Reference Unix timestamp from external source
     uint32_t time_reference_boot_ms;  // Boot time when we got the timestamp
     bool time_acquired;               // Whether we've gotten time from any source
-    bool session_id_decided;          // Have we decided our session ID yet?
 } session_state_t;
 
 typedef struct
@@ -66,8 +65,9 @@ static sensor_state_t sensor = {0};
 static callbacks_t callbacks = {0};
 static save_state_t save_state = {0};
 
-// Track the highest session ID seen (for creating new sessions)
+// Track the highest session ID and write_index seen (for creating new sessions/writes)
 static uint32_t last_session_id = 0;
+static uint32_t last_write_index = 0;
 
 // Read VSYS voltage in millivolts
 uint16_t odometer_read_voltage(void)
@@ -135,108 +135,98 @@ uint16_t odometer_read_voltage(void)
 
 static bool load_count_from_flash(void)
 {
-    uint32_t max_session_id = 0;
-    bool found_valid = false;
-    session_data_t latest_data;
+    // Use the flash module's scan function to get deduplicated sessions in one pass
+    session_data_t sessions[FLASH_SECTOR_COUNT];
+    uint32_t session_count = flash_scan_all_sessions(sessions, FLASH_SECTOR_COUNT);
 
-    // Array to store valid sessions for logging (up to 64)
-    typedef struct
+    if (session_count == 0)
     {
-        session_data_t data;
-        uint32_t sector;
-    } valid_session_t;
-    valid_session_t valid_sessions[FLASH_SECTOR_COUNT];
-    uint32_t valid_count = 0;
+        // No valid data found - start fresh
+        last_session_id = 0;
+        last_write_index = 0;
+        log_printf("[FLASH] No valid previous session found - starting fresh\n");
+        return false;
+    }
 
-    // Scan all 64 sectors to find the one with the highest valid session_id
-    for (uint32_t sector = 0; sector < FLASH_SECTOR_COUNT; sector++)
+    // Find the session with the highest session_id (most recent)
+    uint32_t latest_index = 0;
+    uint32_t max_session_id = sessions[0].session_id;
+    uint32_t max_write_index = sessions[0].write_index;
+
+    for (uint32_t i = 0; i < session_count; i++)
     {
-        session_data_t session_data;
-
-        // Try to read and verify data using flash module
-        // flash_read will automatically erase sectors with newer struct versions
-        if (flash_read(sector, &session_data))
+        // Track global max write_index
+        if (sessions[i].write_index > max_write_index)
         {
-            // Store this valid session for logging
-            valid_sessions[valid_count].data = session_data;
-            valid_sessions[valid_count].sector = sector;
-            valid_count++;
+            max_write_index = sessions[i].write_index;
+        }
 
-            // Check if this is the newest valid entry (highest session_id)
-            if (!found_valid || session_data.session_id > max_session_id)
-            {
-                max_session_id = session_data.session_id;
-                latest_data = session_data;
-                found_valid = true;
-            }
+        // Track the session with highest session_id
+        if (sessions[i].session_id > max_session_id)
+        {
+            max_session_id = sessions[i].session_id;
+            latest_index = i;
         }
     }
+
+    session_data_t latest_data = sessions[latest_index];
 
     // Log the 10 most recent valid sessions (sorted by session_id, descending)
-    if (valid_count > 0)
-    {
-        log_printf("[FLASH] Found %lu valid session(s) in flash\n", valid_count);
-        log_printf("[FLASH] Logging up to 10 most recent sessions:\n");
+    log_printf("[FLASH] Found %lu valid session(s) in flash\n", session_count);
+    log_printf("[FLASH] Logging up to 10 most recent sessions:\n");
 
-        // Simple bubble sort to sort by session_id (descending)
-        for (uint32_t i = 0; i < valid_count - 1; i++)
+    // Simple bubble sort to sort by session_id (descending)
+    for (uint32_t i = 0; i < session_count - 1; i++)
+    {
+        for (uint32_t j = 0; j < session_count - i - 1; j++)
         {
-            for (uint32_t j = 0; j < valid_count - i - 1; j++)
+            if (sessions[j].session_id < sessions[j + 1].session_id)
             {
-                if (valid_sessions[j].data.session_id < valid_sessions[j + 1].data.session_id)
-                {
-                    valid_session_t temp = valid_sessions[j];
-                    valid_sessions[j] = valid_sessions[j + 1];
-                    valid_sessions[j + 1] = temp;
-                }
+                session_data_t temp = sessions[j];
+                sessions[j] = sessions[j + 1];
+                sessions[j + 1] = temp;
             }
         }
-
-        // Log up to 10 most recent
-        uint32_t log_count = (valid_count > 10) ? 10 : valid_count;
-        for (uint32_t i = 0; i < log_count; i++)
-        {
-            const session_data_t *d = &valid_sessions[i].data;
-            log_printf("[FLASH]   [%lu] Sector %lu: ID=%lu, Rotations=%lu/%lu, Time=%lu/%lu sec, Start=%lu, End=%lu, Reported=%s\n",
-                       i + 1,
-                       valid_sessions[i].sector,
-                       d->session_id,
-                       d->session_rotation_count,
-                       d->lifetime_rotation_count,
-                       d->session_active_time_seconds,
-                       d->lifetime_time_seconds,
-                       d->session_start_time_unix,
-                       d->session_end_time_unix,
-                       (d->reported != 0) ? "YES" : "NO");
-        }
     }
 
-    if (found_valid)
+    // Log up to 10 most recent
+    uint32_t log_count = (session_count > 10) ? 10 : session_count;
+    for (uint32_t i = 0; i < log_count; i++)
     {
-        // Load lifetime totals from the most recent session
-        counts.lifetime_rotations = latest_data.lifetime_rotation_count;
-        counts.lifetime_active_seconds = latest_data.lifetime_time_seconds;
-
-        // Store the highest session ID we've seen
-        last_session_id = latest_data.session_id;
-
-        // Start fresh for this session
-        counts.session_rotations = 0;
-        counts.session_active_seconds = 0;
-        session.session_id_decided = false;
-
-        log_printf("[FLASH] Loaded lifetime totals from flash:\n");
-        log_printf("  - Last session ID: %lu\n", last_session_id);
-        log_printf("  - Lifetime totals: %lu rotations, %lu sec\n", counts.lifetime_rotations, counts.lifetime_active_seconds);
-
-        return true;
+        const session_data_t *d = &sessions[i];
+        uint32_t sector = d->write_index % FLASH_SECTOR_COUNT;
+        log_printf("[FLASH]   [%lu] Sector %lu: ID=%lu, WrIdx=%lu, Rotations=%lu/%lu, Time=%lu/%lu sec, Start=%lu, End=%lu, Reported=%s\n",
+                   i + 1,
+                   sector,
+                   d->session_id,
+                   d->write_index,
+                   d->session_rotation_count,
+                   d->lifetime_rotation_count,
+                   d->session_active_time_seconds,
+                   d->lifetime_time_seconds,
+                   d->session_start_time_unix,
+                   d->session_end_time_unix,
+                   (d->reported != 0) ? "YES" : "NO");
     }
 
-    // No valid data found - start fresh
-    last_session_id = 0;
-    session.session_id_decided = false;
-    log_printf("[FLASH] No valid previous session found - starting fresh\n");
-    return false;
+    // Load lifetime totals from the most recent session
+    counts.lifetime_rotations = latest_data.lifetime_rotation_count;
+    counts.lifetime_active_seconds = latest_data.lifetime_time_seconds;
+
+    // Store the highest session ID and write_index we've seen
+    last_session_id = latest_data.session_id;
+    last_write_index = max_write_index;
+
+    // Start fresh for this session
+    counts.session_rotations = 0;
+    counts.session_active_seconds = 0;
+
+    log_printf("[FLASH] Loaded lifetime totals from flash:\n");
+    log_printf("  - Last session ID: %lu\n", last_session_id);
+    log_printf("  - Last write index: %lu\n", last_write_index);
+    log_printf("  - Lifetime totals: %lu rotations, %lu sec\n", counts.lifetime_rotations, counts.lifetime_active_seconds);
+
+    return true;
 }
 
 // Get current Unix timestamp based on time reference
@@ -255,30 +245,6 @@ uint32_t odometer_get_current_unix_time(void)
 void odometer_save_count(void)
 {
     uint32_t current_time_unix = odometer_get_current_unix_time();
-    uint32_t target_session_id;
-
-    // First save: decide session ID (always create new session, never merge)
-    if (!session.session_id_decided)
-    {
-        log_printf("[SESSION] Assigning session ID at first save...\n");
-        log_printf("  - Current time acquired: %s\n", session.time_acquired ? "YES" : "NO");
-        log_printf("  - Current session start: %lu\n", session.session_start_time_unix);
-        log_printf("  - Last session ID from flash: %lu\n", last_session_id);
-
-        // Always create new session (increment from last seen)
-        target_session_id = last_session_id + 1;
-        log_printf("[SESSION] Decision: NEW session -> ID %lu\n", target_session_id);
-
-        // Lock in the session ID for this execution
-        session.current_session_id = target_session_id;
-        session.session_id_decided = true;
-        log_printf("[SESSION] Session ID locked: %lu\n", target_session_id);
-    }
-    else
-    {
-        // Already decided - use the same session ID
-        target_session_id = session.current_session_id;
-    }
 
     // Calculate current session end time
     uint32_t session_end_time = current_time_unix;
@@ -292,14 +258,15 @@ void odometer_save_count(void)
                    session_end_time, active_seconds, session.session_start_time_unix);
     }
 
-    // Calculate which sector to write to
-    uint32_t sector_index = target_session_id % FLASH_SECTOR_COUNT;
+    // Increment write_index for this save (globally incrementing, never resets)
+    last_write_index++;
 
     // Prepare session data structure (no internal flash fields needed)
     session_data_t data;
     memset(&data, 0, sizeof(session_data_t));
 
-    data.session_id = target_session_id;
+    data.session_id = session.current_session_id;
+    data.write_index = last_write_index; // Globally incrementing write counter
     data.session_rotation_count = counts.session_rotations;
     data.session_active_time_seconds = odometer_get_session_active_time_seconds();
     data.session_start_time_unix = session.session_start_time_unix;
@@ -308,8 +275,8 @@ void odometer_save_count(void)
     data.lifetime_time_seconds = odometer_get_active_time_seconds();
     data.reported = 0; // New/updated sessions are not reported
 
-    // Write to flash with verification and automatic retry
-    if (!flash_write(sector_index, &data, "Writing session to flash"))
+    // Write to flash (sector determined by write_index)
+    if (!flash_write(&data, "Writing session to flash"))
     {
         log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
         log_printf("[FLASH WRITE] Data integrity cannot be guaranteed. System may need attention.\n");
@@ -343,9 +310,15 @@ void odometer_init(uint8_t pin)
         counts.lifetime_active_seconds = 0;
     }
 
-    // Start fresh session
+    // Initialize save state to current lifetime count
+    save_state.last_saved_count = counts.lifetime_rotations;
+
+    // Start fresh session (always create new session on startup)
     counts.session_rotations = 0;
     counts.session_active_seconds = 0;
+    session.current_session_id = last_session_id + 1;
+
+    log_printf("[SESSION] Starting new session ID: %lu\n", session.current_session_id);
 }
 
 void odometer_set_led_callback(led_callback_t callback)
@@ -504,36 +477,28 @@ void odometer_add_rotation(void)
 // Get list of unreported sessions from flash
 uint32_t odometer_get_unreported_sessions(session_record_t *sessions, uint32_t max_sessions)
 {
+    // Exclude the current active session
+    uint32_t exclude_session_id = session.current_session_id;
+    log_printf("[SESSION] Excluding session %lu from unreported list (current session)\n", exclude_session_id);
+
+    // Use flash module's scan function to get deduplicated sessions in one pass
+    session_data_t all_sessions[FLASH_SECTOR_COUNT];
+    uint32_t all_count = flash_scan_all_sessions(all_sessions, FLASH_SECTOR_COUNT);
+
+    // Filter for unreported sessions (excluding current session)
     uint32_t count = 0;
-
-    // Exclude the current active session (if decided)
-    uint32_t exclude_session_id = 0;
-    if (session.session_id_decided)
+    for (uint32_t i = 0; i < all_count && count < max_sessions; i++)
     {
-        exclude_session_id = session.current_session_id;
-        log_printf("[SESSION] Excluding session %lu from unreported list (current session)\n", exclude_session_id);
-    }
+        const session_data_t *data = &all_sessions[i];
 
-    // Scan all 64 sectors for unreported sessions
-    for (uint32_t sector = 0; sector < FLASH_SECTOR_COUNT && count < max_sessions; sector++)
-    {
-        session_data_t session_data;
-
-        // Verify data is valid and unreported using flash module
-        if (flash_read(sector, &session_data) && session_data.reported == 0)
+        // Only include unreported sessions that aren't the current one
+        if (data->reported == 0 && data->session_id != exclude_session_id)
         {
-            // Skip the excluded session
-            if (exclude_session_id != 0 && session_data.session_id == exclude_session_id)
-            {
-                continue;
-            }
-
-            // Add this session to the list
-            sessions[count].session_id = session_data.session_id;
-            sessions[count].rotation_count = session_data.session_rotation_count;
-            sessions[count].active_time_seconds = session_data.session_active_time_seconds;
-            sessions[count].start_time_unix = session_data.session_start_time_unix;
-            sessions[count].end_time_unix = session_data.session_end_time_unix;
+            sessions[count].session_id = data->session_id;
+            sessions[count].rotation_count = data->session_rotation_count;
+            sessions[count].active_time_seconds = data->session_active_time_seconds;
+            sessions[count].start_time_unix = data->session_start_time_unix;
+            sessions[count].end_time_unix = data->session_end_time_unix;
             count++;
         }
     }
@@ -544,90 +509,50 @@ uint32_t odometer_get_unreported_sessions(session_record_t *sessions, uint32_t m
 // Mark a specific session as reported
 bool odometer_mark_session_reported(uint32_t session_id)
 {
-    // Check if this is the current active session
-    // If so, we need to finalize it and start a fresh session
-    if (session.session_id_decided && session_id == session.current_session_id)
+    // If marking the current session, save it first, then start a new one
+    if (session_id == session.current_session_id)
     {
         log_printf("[SESSION] Marking current session %lu as reported\n", session_id);
+        odometer_save_count(); // Persist current state before marking
+    }
 
-        // First, save the current session state to flash and mark as reported
-        // We need to save first to ensure current data is persisted
-        odometer_save_count();
+    // Find and update the session in flash
+    session_data_t data;
+    if (!flash_find_session(session_id, &data))
+    {
+        log_printf("[FLASH] ERROR: Session %lu not found in flash when trying to mark as reported\n", session_id);
+        return false; // Session not found
+    }
 
-        // Now mark it as reported in flash
-        for (uint32_t sector = 0; sector < FLASH_SECTOR_COUNT; sector++)
-        {
-            session_data_t data;
+    data.reported = 1;
+    if (!flash_write(&data, session_id == session.current_session_id ? "Marking session as REPORTED" : "Marking OLD session as REPORTED"))
+    {
+        log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
+        log_printf("[FLASH WRITE] Session %lu may not be properly marked as reported.\n", session_id);
+    }
 
-            if (flash_read(sector, &data) && data.session_id == session_id)
-            {
-                data.reported = 1;
+    log_printf("[FLASH WRITE] ✓ %s session %lu marked as reported in flash\n",
+               session_id == session.current_session_id ? "Current" : "Old", session_id);
 
-                // Write to flash with verification and automatic retry
-                if (!flash_write(sector, &data, "Marking session as REPORTED"))
-                {
-                    log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
-                    log_printf("[FLASH WRITE] Session %lu may not be properly marked as reported.\n", session_id);
-                }
-
-                log_printf("[FLASH WRITE] ✓ Session %lu marked as reported in flash\n", session_id);
-                break;
-            }
-        }
-
-        // Now create a new session
-        uint32_t new_session_id = session_id + 1;
-        session.current_session_id = new_session_id;
-
-        // Start completely fresh
+    // If this was the current session, start a new one
+    if (session_id == session.current_session_id)
+    {
+        session.current_session_id = session_id + 1;
         counts.session_rotations = 0;
         counts.session_active_seconds = 0;
-
-        // Reset speed window since we're starting a new session
         odometer_reset_speed_window();
 
-        // New session starts now
         if (session.time_acquired)
         {
             session.session_start_time_unix = odometer_get_current_unix_time();
         }
+
         log_printf("  - Starting fresh session with zero counts\n");
-
         log_printf("  - New session ID: %lu (rotations: %lu)\n",
-                   new_session_id, counts.session_rotations);
-
-        // Save the new session to flash immediately (even if empty)
-        // This ensures the new session ID is persisted
-        odometer_save_count();
-
-        return true;
+                   session.current_session_id, counts.session_rotations);
     }
 
-    // Normal case: find the session in flash and mark it as reported
-    for (uint32_t sector = 0; sector < FLASH_SECTOR_COUNT; sector++)
-    {
-        session_data_t data;
-
-        // Check if this is the session we're looking for
-        if (flash_read(sector, &data) && data.session_id == session_id)
-        {
-            // Found it! Update the reported flag
-            data.reported = 1;
-
-            // Write to flash with verification and automatic retry
-            if (!flash_write(sector, &data, "Marking OLD session as REPORTED"))
-            {
-                log_printf("[FLASH WRITE] ERROR: Flash write verification failed!\n");
-                log_printf("[FLASH WRITE] Session %lu may not be properly marked as reported.\n", session_id);
-            }
-
-            log_printf("[FLASH WRITE] ✓ Old session %lu marked as reported in flash\n", session_id);
-
-            return true;
-        }
-    }
-
-    return false; // Session not found
+    return true;
 }
 
 // Set time reference from external source (BLE or NTP)
@@ -671,12 +596,6 @@ bool odometer_has_time(void)
 uint32_t odometer_get_current_session_id(void)
 {
     return session.current_session_id;
-}
-
-// Check if session ID has been decided
-bool odometer_is_session_id_decided(void)
-{
-    return session.session_id_decided;
 }
 
 // Set lifetime totals (for transferring progress to a new device)

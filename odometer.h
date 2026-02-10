@@ -79,11 +79,8 @@ bool odometer_has_time(void);
 // Get current Unix timestamp (0 if time not acquired)
 uint32_t odometer_get_current_unix_time(void);
 
-// Get current session ID (0 if not yet decided)
+// Get current session ID
 uint32_t odometer_get_current_session_id(void);
-
-// Check if session ID has been decided
-bool odometer_is_session_id_decided(void);
 
 // Reset the speed calculation window (called when starting a new session)
 void odometer_reset_speed_window(void);
