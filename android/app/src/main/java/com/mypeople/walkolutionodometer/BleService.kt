@@ -754,6 +754,39 @@ class BleService : Service() {
 
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.e(TAG, "Connection failed with status: $status")
+
+                // Save current session if it has non-zero progress
+                val currentData = _odometerData.value
+                if (currentData.sessionId > 0 && currentData.sessionRotations > 0) {
+                    Log.i(TAG, "Saving current session (ID ${currentData.sessionId}) to unreported sessions due to connection error")
+                    val currentTime = System.currentTimeMillis() / 1000
+                    val startTime = currentTime - currentData.sessionTimeSeconds
+
+                    val sessionToSave = SessionRecord(
+                        sessionId = currentData.sessionId,
+                        rotationCount = currentData.sessionRotations,
+                        activeTimeSeconds = currentData.sessionTimeSeconds,
+                        startTimeUnix = startTime,
+                        endTimeUnix = currentTime
+                    )
+
+                    // Add to unreported sessions list if not already present
+                    val currentSessions = _unreportedSessions.value
+                    if (currentSessions.none { it.sessionId == sessionToSave.sessionId }) {
+                        _unreportedSessions.value = currentSessions + sessionToSave
+                    }
+
+                    // Reset current session to zero with incremented ID
+                    _odometerData.value = currentData.copy(
+                        sessionMiles = 0f,
+                        sessionTime = "0:00",
+                        sessionAvgSpeed = 0f,
+                        sessionId = currentData.sessionId + 1,
+                        sessionRotations = 0,
+                        sessionTimeSeconds = 0
+                    )
+                }
+
                 _connectionStatus.value = "Connection error: $status"
                 _isConnected.value = false
                 isConnecting = false
@@ -807,6 +840,39 @@ class BleService : Service() {
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.w(TAG, "BLE disconnected")
+
+                    // Save current session if it has non-zero progress
+                    val currentData = _odometerData.value
+                    if (currentData.sessionId > 0 && currentData.sessionRotations > 0) {
+                        Log.i(TAG, "Saving current session (ID ${currentData.sessionId}) to unreported sessions due to disconnect")
+                        val currentTime = System.currentTimeMillis() / 1000
+                        val startTime = currentTime - currentData.sessionTimeSeconds
+
+                        val sessionToSave = SessionRecord(
+                            sessionId = currentData.sessionId,
+                            rotationCount = currentData.sessionRotations,
+                            activeTimeSeconds = currentData.sessionTimeSeconds,
+                            startTimeUnix = startTime,
+                            endTimeUnix = currentTime
+                        )
+
+                        // Add to unreported sessions list if not already present
+                        val currentSessions = _unreportedSessions.value
+                        if (currentSessions.none { it.sessionId == sessionToSave.sessionId }) {
+                            _unreportedSessions.value = currentSessions + sessionToSave
+                        }
+
+                        // Reset current session to zero with incremented ID
+                        _odometerData.value = currentData.copy(
+                            sessionMiles = 0f,
+                            sessionTime = "0:00",
+                            sessionAvgSpeed = 0f,
+                            sessionId = currentData.sessionId + 1,
+                            sessionRotations = 0,
+                            sessionTimeSeconds = 0
+                        )
+                    }
+
                     _isConnected.value = false
                     isConnecting = false
                     connectionAttemptStartTime = 0

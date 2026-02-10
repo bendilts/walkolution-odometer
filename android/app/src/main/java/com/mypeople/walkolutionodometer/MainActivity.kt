@@ -92,7 +92,7 @@ data class SessionRecord(
         get() = if (endTimeUnix == 0L) {
             "Unknown"
         } else {
-            val dateFormat = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+            val dateFormat = java.text.SimpleDateFormat("MMM dd HH:mm", java.util.Locale.getDefault())
             dateFormat.format(java.util.Date(endTimeUnix * 1000))
         }
 
@@ -116,204 +116,20 @@ data class SessionRecord(
     }
 }
 
-data class SessionGroup(
-    val sessions: List<SessionRecord>,
-    val totalRotationCount: Int,
-    val totalActiveTimeSeconds: Int,
-    val earliestStartTimeUnix: Long,
-    val latestEndTimeUnix: Long
-) {
-    val miles: Float get() = totalRotationCount * MILES_PER_ROTATION
-    val formattedTime: String get() = formatTime(totalActiveTimeSeconds)
-
-    val avgSpeed: Float get() = if (totalActiveTimeSeconds > 0) {
-        miles / (totalActiveTimeSeconds / 3600f)
-    } else 0f
-
-    val startDateStr: String
-        get() = if (earliestStartTimeUnix == 0L) {
-            "Unknown"
-        } else {
-            val dateFormat = java.text.SimpleDateFormat("MMM dd HH:mm", java.util.Locale.getDefault())
-            dateFormat.format(java.util.Date(earliestStartTimeUnix * 1000))
-        }
-
-    val endDateStr: String
-        get() = if (latestEndTimeUnix == 0L) {
-            "Unknown"
-        } else {
-            val dateFormat = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
-            dateFormat.format(java.util.Date(latestEndTimeUnix * 1000))
-        }
-
-    val sessionIds: List<Int> get() = sessions.map { it.sessionId }
-
-    private fun formatTime(seconds: Int): String {
-        val hours = seconds / 3600
-        val minutes = (seconds % 3600) / 60
-        val secs = seconds % 60
-        return if (hours > 0) {
-            String.format("%d:%02d:%02d", hours, minutes, secs)
-        } else {
-            String.format("%d:%02d", minutes, secs)
-        }
-    }
-
-    companion object {
-        const val CM_PER_ROTATION = 34.56f
-        const val METERS_PER_MILE = 1609.344f
-        const val MILES_PER_ROTATION = CM_PER_ROTATION / 100.0f / METERS_PER_MILE
-    }
-}
 
 // Top-level constants for use in SessionRecord
 private const val CM_PER_ROTATION = 34.56f
 private const val METERS_PER_MILE = 1609.344f
 private const val MILES_PER_ROTATION = CM_PER_ROTATION / 100.0f / METERS_PER_MILE
 
-/**
- * Groups sessions according to these rules:
- * 1. Consecutive sessions without timestamps are joined together
- * 2. Sessions WITH timestamps that are less than 30 minutes apart are joined together,
- *    including any sessions without timestamps that fall between them
- * 3. Any session < 0.25 miles ALWAYS joins to the following sessions (not worth reporting alone)
- *
- * When joining sessions:
- * - Keep the latest end time
- * - Keep the earliest start time
- * - Add up all walking time and distance
- */
-fun groupSessions(sessions: List<SessionRecord>): List<SessionGroup> {
-    if (sessions.isEmpty()) return emptyList()
-
-    val groups = mutableListOf<SessionGroup>()
-    var currentGroup = mutableListOf<SessionRecord>()
-
-    val sortedSessions = sessions.sortedBy {
-        if (it.startTimeUnix == 0L) Long.MAX_VALUE else it.startTimeUnix
-    }
-
-    for (session in sortedSessions) {
-        if (currentGroup.isEmpty()) {
-            // Start a new group
-            currentGroup.add(session)
-        } else {
-            val lastSession = currentGroup.last()
-
-            // Check if we should join this session to the current group
-            val shouldJoin = when {
-                // Rule 3: If last session was < 0.25 miles, always join it to this one
-                lastSession.miles < 0.25f -> true
-
-                // Both have no timestamps - join them
-                lastSession.endTimeUnix == 0L && session.startTimeUnix == 0L -> true
-
-                // Last has no timestamp, this has timestamp - don't join
-                lastSession.endTimeUnix == 0L && session.startTimeUnix != 0L -> false
-
-                // Last has timestamp, this has no timestamp - check if there's a valid session after this
-                lastSession.endTimeUnix != 0L && session.startTimeUnix == 0L -> {
-                    // Look ahead to see if there's another timestamped session nearby
-                    val nextTimestampedSession = sortedSessions.dropWhile { it.sessionId <= session.sessionId }
-                        .firstOrNull { it.startTimeUnix != 0L }
-
-                    if (nextTimestampedSession != null) {
-                        // Check if next timestamped session is within 30 minutes of last timestamped in group
-                        val gapSeconds = nextTimestampedSession.startTimeUnix - lastSession.endTimeUnix
-                        gapSeconds < 30 * 60
-                    } else {
-                        // No more timestamped sessions, keep with current group
-                        true
-                    }
-                }
-
-                // Both have timestamps - check if gap is less than 30 minutes
-                else -> {
-                    val gapSeconds = session.startTimeUnix - lastSession.endTimeUnix
-                    gapSeconds < 30 * 60
-                }
-            }
-
-            if (shouldJoin) {
-                currentGroup.add(session)
-            } else {
-                // Finalize current group and start a new one
-                groups.add(createSessionGroup(currentGroup))
-                currentGroup = mutableListOf(session)
-            }
-        }
-    }
-
-    // Don't forget the last group
-    if (currentGroup.isNotEmpty()) {
-        groups.add(createSessionGroup(currentGroup))
-    }
-
-    return groups
-}
-
-private fun createSessionGroup(sessions: List<SessionRecord>): SessionGroup {
-    val totalRotations = sessions.sumOf { it.rotationCount }
-    val totalTime = sessions.sumOf { it.activeTimeSeconds }
-    val earliestStart = sessions.mapNotNull {
-        if (it.startTimeUnix == 0L) null else it.startTimeUnix
-    }.minOrNull() ?: 0L
-    val latestEnd = sessions.mapNotNull {
-        if (it.endTimeUnix == 0L) null else it.endTimeUnix
-    }.maxOrNull() ?: 0L
-
-    return SessionGroup(
-        sessions = sessions,
-        totalRotationCount = totalRotations,
-        totalActiveTimeSeconds = totalTime,
-        earliestStartTimeUnix = earliestStart,
-        latestEndTimeUnix = latestEnd
-    )
-}
-
-/**
- * Finds the group that the current session would belong to if it were in the list.
- * Returns null if the current session wouldn't be grouped with any existing sessions.
- *
- * Rules for joining current session to previous group:
- * 1. Join if the entire most-recent group is < 0.25 miles total
- * 2. Join if any session in the most-recent group ended less than 30 minutes ago
- */
-fun findGroupForCurrentSession(
-    currentSessionId: Int,
-    currentSessionEndTime: Long,
-    currentSessionMiles: Float,
-    sessionGroups: List<SessionGroup>
-): SessionGroup? {
-    if (currentSessionId == 0) return null
-    if (sessionGroups.isEmpty()) return null
-
-    // The current session would be the most recent one
-    // Check if it would join with the last group (most recent group)
-    val lastGroup = sessionGroups.lastOrNull() ?: return null
-
-    // Rule 1: Join if the entire most-recent group is < 0.25 miles total
-    if (lastGroup.miles < 0.25f) {
-        return lastGroup
-    }
-
-    // Rule 2: Join if any session in the most-recent group ended less than 30 minutes ago
-    // Need to check current time against each session's end time
-    val currentTime = System.currentTimeMillis() / 1000
-    val hasRecentSession = lastGroup.sessions.any { session ->
-        if (session.endTimeUnix == 0L) {
-            // Session without timestamp - treat as recent
-            true
-        } else {
-            val timeSinceEnd = currentTime - session.endTimeUnix
-            timeSinceEnd < 30 * 60
-        }
-    }
-
-    return if (hasRecentSession) {
-        lastGroup
+private fun formatTimeFromSeconds(seconds: Int): String {
+    val hours = seconds / 3600
+    val minutes = (seconds % 3600) / 60
+    val secs = seconds % 60
+    return if (hours > 0) {
+        String.format("%d:%02d:%02d", hours, minutes, secs)
     } else {
-        null
+        String.format("%d:%02d", minutes, secs)
     }
 }
 
@@ -326,14 +142,7 @@ class MainActivity : ComponentActivity() {
     private var connectionStatus = mutableStateOf("Disconnected")
     private var odometerData = mutableStateOf(OdometerData())
     private var unreportedSessions = mutableStateOf<List<SessionRecord>>(emptyList())
-    private var sessionGroups = mutableStateOf<List<SessionGroup>>(emptyList())
-    private var currentSessionGroup = mutableStateOf<SessionGroup?>(null)
     private var isConnected = mutableStateOf(false)
-
-    // Computed state for display - includes grouped sessions
-    private var displaySessionMiles = mutableStateOf(0f)
-    private var displaySessionTime = mutableStateOf("0:00")
-    private var displaySessionAvgSpeed = mutableStateOf(0f)
 
     // Strava integration
     private lateinit var stravaRepository: StravaRepository
@@ -371,13 +180,11 @@ class MainActivity : ComponentActivity() {
             lifecycleScope.launch {
                 bleService?.unreportedSessions?.collect { sessions ->
                     unreportedSessions.value = sessions
-                    updateSessionGroupsAndCurrentGroup()
                 }
             }
             lifecycleScope.launch {
                 bleService?.odometerData?.collect { data ->
                     odometerData.value = data
-                    updateSessionGroupsAndCurrentGroup()
                 }
             }
             lifecycleScope.launch {
@@ -426,15 +233,10 @@ class MainActivity : ComponentActivity() {
                 OdometerScreenWithTopBar(
                     connectionStatus = connectionStatus.value,
                     odometerData = odometerData.value,
-                    displaySessionMiles = displaySessionMiles.value,
-                    displaySessionTime = displaySessionTime.value,
-                    displaySessionAvgSpeed = displaySessionAvgSpeed.value,
-                    hasGroupedSessions = currentSessionGroup.value != null,
-                    sessionGroups = sessionGroups.value,
-                    onUploadGroup = { group -> uploadGroupToStrava(group) },
-                    onDiscardGroup = { group -> discardGroup(group) },
+                    unreportedSessions = unreportedSessions.value,
+                    onUploadSessions = { sessions -> uploadSessionsToStrava(sessions) },
+                    onDiscardSession = { session -> discardSession(session) },
                     stravaAuthenticated = stravaAuthenticated.value,
-                    onUploadCurrentSession = { uploadCurrentSessionToStrava() },
                     uploadingSessions = uploadingSessions.value,
                     isBleConnected = isConnected.value,
                     onOpenSettings = { openSettings() },
@@ -509,255 +311,75 @@ class MainActivity : ComponentActivity() {
         bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
     }
 
-    private fun updateSessionGroupsAndCurrentGroup() {
-        val allGroups = groupSessions(unreportedSessions.value)
-        val currentData = odometerData.value
-
-        // Calculate current session's estimated end time
-        val currentSessionEndTime = if (currentData.sessionId > 0 && currentData.sessionTimeSeconds > 0) {
-            System.currentTimeMillis() / 1000
-        } else {
-            0L
-        }
-
-        // Find which group the current session belongs to
-        val groupForCurrent = findGroupForCurrentSession(
-            currentData.sessionId,
-            currentSessionEndTime,
-            currentData.sessionMiles,
-            allGroups
-        )
-
-        if (groupForCurrent != null) {
-            // Create a new group that includes the current session
-            val currentSession = SessionRecord(
-                sessionId = currentData.sessionId,
-                rotationCount = currentData.sessionRotations,
-                activeTimeSeconds = currentData.sessionTimeSeconds,
-                startTimeUnix = currentSessionEndTime - currentData.sessionTimeSeconds,
-                endTimeUnix = currentSessionEndTime
-            )
-
-            val combinedSessions = groupForCurrent.sessions + currentSession
-            val combinedGroup = createSessionGroup(combinedSessions)
-            currentSessionGroup.value = combinedGroup
-
-            // Filter out the group that contains the current session
-            sessionGroups.value = allGroups.filter { it != groupForCurrent }
-
-            // Update display stats to show combined values
-            displaySessionMiles.value = combinedGroup.miles
-            displaySessionTime.value = combinedGroup.formattedTime
-            displaySessionAvgSpeed.value = combinedGroup.avgSpeed
-        } else {
-            // Current session doesn't belong to any group
-            currentSessionGroup.value = null
-            sessionGroups.value = allGroups
-
-            // Display only current session stats
-            displaySessionMiles.value = currentData.sessionMiles
-            displaySessionTime.value = currentData.sessionTime
-            displaySessionAvgSpeed.value = currentData.sessionAvgSpeed
-        }
+    private fun uploadSessionToStrava(session: SessionRecord) {
+        uploadSessionsToStrava(listOf(session))
     }
 
-    private fun uploadGroupToStrava(group: SessionGroup) {
+    private fun uploadSessionsToStrava(sessions: List<SessionRecord>) {
         lifecycleScope.launch {
-            // Check if any sessions in the group are already uploaded
-            val alreadyUploaded = group.sessionIds.any { sessionCacheManager.isSessionUploaded(it) }
+            if (sessions.isEmpty()) return@launch
+
+            // Check if any sessions are already uploaded
+            val alreadyUploaded = sessions.any { sessionCacheManager.isSessionUploaded(it.sessionId) }
             if (alreadyUploaded) {
                 stravaStatus.value = "Some sessions already uploaded to Strava"
                 return@launch
             }
 
-            // Mark all sessions in the group as "uploading"
-            uploadingSessions.value = uploadingSessions.value + group.sessionIds.toSet()
-            stravaStatus.value = "Uploading ${group.sessions.size} session(s) to Strava..."
+            // Mark all sessions as uploading
+            val sessionIds = sessions.map { it.sessionId }.toSet()
+            uploadingSessions.value = uploadingSessions.value + sessionIds
+            stravaStatus.value = "Uploading ${sessions.size} session(s) to Strava..."
 
-            // Create a single SessionRecord representing the entire group
-            val groupSession = SessionRecord(
-                sessionId = group.sessions.first().sessionId, // Use first session ID for tracking
-                rotationCount = group.totalRotationCount,
-                activeTimeSeconds = group.totalActiveTimeSeconds,
-                startTimeUnix = group.earliestStartTimeUnix,
-                endTimeUnix = group.latestEndTimeUnix
+            // Create combined session for upload
+            val combinedSession = SessionRecord(
+                sessionId = sessions.first().sessionId,
+                rotationCount = sessions.sumOf { it.rotationCount },
+                activeTimeSeconds = sessions.sumOf { it.activeTimeSeconds },
+                startTimeUnix = sessions.mapNotNull {
+                    if (it.startTimeUnix == 0L) null else it.startTimeUnix
+                }.minOrNull() ?: 0L,
+                endTimeUnix = sessions.mapNotNull {
+                    if (it.endTimeUnix == 0L) null else it.endTimeUnix
+                }.maxOrNull() ?: 0L
             )
 
-            val result = stravaRepository.uploadSession(groupSession)
+            val result = stravaRepository.uploadSession(combinedSession)
             if (result.isSuccess) {
                 val activity = result.getOrNull()!!
                 stravaStatus.value = "Uploaded to Strava!"
 
-                val distanceMeters = group.totalRotationCount * CM_PER_ROTATION / 100f
+                val totalDistanceMeters = combinedSession.rotationCount * CM_PER_ROTATION / 100f
 
-                // Mark ALL sessions in the group as uploaded
-                for (session in group.sessions) {
+                // Mark ALL original sessions as uploaded
+                for (session in sessions) {
                     sessionCacheManager.addUploadedSession(
                         UploadedSession(
                             sessionId = session.sessionId,
                             stravaActivityId = activity.id,
                             uploadTimestamp = System.currentTimeMillis() / 1000,
-                            distanceMeters = distanceMeters / group.sessions.size, // Split distance evenly
+                            distanceMeters = session.rotationCount * CM_PER_ROTATION / 100f,
                             elapsedTimeSeconds = session.activeTimeSeconds
                         )
                     )
 
-                    // If BLE is connected, send confirmation to Pico for each session
+                    // If BLE is connected, send confirmation to Pico for EACH session
                     if (isConnected.value) {
                         markSessionReported(session.sessionId)
                     }
                 }
 
-                // Remove all sessions in the group from displayed list
+                // Remove ALL sessions from displayed list
                 unreportedSessions.value = unreportedSessions.value.filter {
-                    it.sessionId !in group.sessionIds
+                    it.sessionId !in sessionIds
                 }
                 bleService?.updateUnreportedSessions(unreportedSessions.value)
-                updateSessionGroupsAndCurrentGroup()
             } else {
                 stravaStatus.value = "Upload failed: ${result.exceptionOrNull()?.message}"
             }
 
             // Remove all sessions from uploading set
-            uploadingSessions.value = uploadingSessions.value - group.sessionIds.toSet()
-        }
-    }
-
-    private fun uploadCurrentSessionToStrava() {
-        val currentData = odometerData.value
-        if (currentData.sessionId == 0 || currentData.sessionRotations == 0) {
-            stravaStatus.value = "No session to upload"
-            return
-        }
-
-        lifecycleScope.launch {
-            // Check if the current session belongs to a group
-            val group = currentSessionGroup.value
-
-            if (group != null) {
-                // Upload the entire group including the current session
-                val alreadyUploaded = group.sessionIds.any { sessionCacheManager.isSessionUploaded(it) }
-                if (alreadyUploaded) {
-                    stravaStatus.value = "Some sessions already uploaded to Strava"
-                    return@launch
-                }
-
-                // Mark all sessions in the group as "uploading"
-                uploadingSessions.value = uploadingSessions.value + group.sessionIds.toSet()
-                val sessionCount = group.sessions.size
-                stravaStatus.value = "Uploading $sessionCount session(s) to Strava..."
-
-                // Create a single SessionRecord representing the entire group
-                val groupSession = SessionRecord(
-                    sessionId = group.sessions.first().sessionId,
-                    rotationCount = group.totalRotationCount,
-                    activeTimeSeconds = group.totalActiveTimeSeconds,
-                    startTimeUnix = group.earliestStartTimeUnix,
-                    endTimeUnix = group.latestEndTimeUnix
-                )
-
-                val result = stravaRepository.uploadSession(groupSession)
-                if (result.isSuccess) {
-                    val activity = result.getOrNull()!!
-                    stravaStatus.value = "Uploaded to Strava!"
-
-                    val distanceMeters = group.totalRotationCount * CM_PER_ROTATION / 100f
-
-                    // Mark ALL sessions in the group as uploaded (excluding current, which isn't saved yet)
-                    for (session in group.sessions) {
-                        if (session.sessionId != currentData.sessionId) {
-                            sessionCacheManager.addUploadedSession(
-                                UploadedSession(
-                                    sessionId = session.sessionId,
-                                    stravaActivityId = activity.id,
-                                    uploadTimestamp = System.currentTimeMillis() / 1000,
-                                    distanceMeters = distanceMeters / group.sessions.size,
-                                    elapsedTimeSeconds = session.activeTimeSeconds
-                                )
-                            )
-
-                            // If BLE is connected, send confirmation to Pico for each session
-                            if (isConnected.value) {
-                                markSessionReported(session.sessionId)
-                            }
-                        }
-                    }
-
-                    // Mark current session as uploaded
-                    sessionCacheManager.addUploadedSession(
-                        UploadedSession(
-                            sessionId = currentData.sessionId,
-                            stravaActivityId = activity.id,
-                            uploadTimestamp = System.currentTimeMillis() / 1000,
-                            distanceMeters = distanceMeters / group.sessions.size,
-                            elapsedTimeSeconds = currentData.sessionTimeSeconds
-                        )
-                    )
-
-                    // Send confirmation for current session
-                    if (isConnected.value) {
-                        markSessionReported(currentData.sessionId)
-                    }
-
-                    // Remove all non-current sessions in the group from displayed list
-                    unreportedSessions.value = unreportedSessions.value.filter {
-                        it.sessionId !in group.sessionIds || it.sessionId == currentData.sessionId
-                    }
-                    bleService?.updateUnreportedSessions(unreportedSessions.value)
-                    updateSessionGroupsAndCurrentGroup()
-                } else {
-                    stravaStatus.value = "Upload failed: ${result.exceptionOrNull()?.message}"
-                }
-
-                // Remove all sessions from uploading set
-                uploadingSessions.value = uploadingSessions.value - group.sessionIds.toSet()
-            } else {
-                // Upload just the current session (not part of any group)
-                if (sessionCacheManager.isSessionUploaded(currentData.sessionId)) {
-                    stravaStatus.value = "Already uploaded to Strava"
-                    return@launch
-                }
-
-                uploadingSessions.value = uploadingSessions.value + currentData.sessionId
-                stravaStatus.value = "Uploading current session..."
-
-                val currentTime = System.currentTimeMillis() / 1000
-                val startTime = currentTime - currentData.sessionTimeSeconds
-                val session = SessionRecord(
-                    sessionId = currentData.sessionId,
-                    rotationCount = currentData.sessionRotations,
-                    activeTimeSeconds = currentData.sessionTimeSeconds,
-                    startTimeUnix = startTime,
-                    endTimeUnix = currentTime
-                )
-
-                val result = stravaRepository.uploadSession(session)
-                if (result.isSuccess) {
-                    val activity = result.getOrNull()!!
-                    stravaStatus.value = "Uploaded to Strava!"
-
-                    val distanceMeters = session.rotationCount * CM_PER_ROTATION / 100f
-
-                    sessionCacheManager.addUploadedSession(
-                        UploadedSession(
-                            sessionId = session.sessionId,
-                            stravaActivityId = activity.id,
-                            uploadTimestamp = currentTime,
-                            distanceMeters = distanceMeters,
-                            elapsedTimeSeconds = session.activeTimeSeconds
-                        )
-                    )
-
-                    // If BLE is connected, send confirmation to Pico
-                    if (isConnected.value) {
-                        markSessionReported(session.sessionId)
-                    }
-                } else {
-                    stravaStatus.value = "Upload failed: ${result.exceptionOrNull()?.message}"
-                }
-
-                uploadingSessions.value = uploadingSessions.value - currentData.sessionId
-            }
+            uploadingSessions.value = uploadingSessions.value - sessionIds
         }
     }
 
@@ -765,24 +387,21 @@ class MainActivity : ComponentActivity() {
         bleService?.markSessionReported(sessionId)
     }
 
-    private fun discardGroup(group: SessionGroup) {
+    private fun discardSession(session: SessionRecord) {
         lifecycleScope.launch {
-            // Mark ALL sessions in the group as discarded
-            for (session in group.sessions) {
-                sessionCacheManager.addDiscardedSession(session.sessionId)
+            // Mark session as discarded
+            sessionCacheManager.addDiscardedSession(session.sessionId)
 
-                // If BLE is connected, send the discard command immediately
-                if (isConnected.value) {
-                    markSessionReported(session.sessionId)
-                }
+            // If BLE is connected, send the discard command immediately
+            if (isConnected.value) {
+                markSessionReported(session.sessionId)
             }
 
-            // Remove all sessions in the group from displayed list immediately
+            // Remove session from displayed list immediately
             unreportedSessions.value = unreportedSessions.value.filter {
-                it.sessionId !in group.sessionIds
+                it.sessionId != session.sessionId
             }
             bleService?.updateUnreportedSessions(unreportedSessions.value)
-            updateSessionGroupsAndCurrentGroup()
         }
     }
 
@@ -812,15 +431,10 @@ class MainActivity : ComponentActivity() {
 fun OdometerScreenWithTopBar(
     connectionStatus: String,
     odometerData: OdometerData,
-    displaySessionMiles: Float,
-    displaySessionTime: String,
-    displaySessionAvgSpeed: Float,
-    hasGroupedSessions: Boolean,
-    sessionGroups: List<SessionGroup>,
-    onUploadGroup: (SessionGroup) -> Unit,
-    onDiscardGroup: (SessionGroup) -> Unit,
+    unreportedSessions: List<SessionRecord>,
+    onUploadSessions: (List<SessionRecord>) -> Unit,
+    onDiscardSession: (SessionRecord) -> Unit,
     stravaAuthenticated: Boolean,
-    onUploadCurrentSession: () -> Unit,
     uploadingSessions: Set<Int>,
     isBleConnected: Boolean,
     onOpenSettings: () -> Unit,
@@ -890,15 +504,10 @@ fun OdometerScreenWithTopBar(
         OdometerScreen(
             connectionStatus = connectionStatus,
             odometerData = odometerData,
-            displaySessionMiles = displaySessionMiles,
-            displaySessionTime = displaySessionTime,
-            displaySessionAvgSpeed = displaySessionAvgSpeed,
-            hasGroupedSessions = hasGroupedSessions,
-            sessionGroups = sessionGroups,
-            onUploadGroup = onUploadGroup,
-            onDiscardGroup = onDiscardGroup,
+            unreportedSessions = unreportedSessions,
+            onUploadSessions = onUploadSessions,
+            onDiscardSession = onDiscardSession,
             stravaAuthenticated = stravaAuthenticated,
-            onUploadCurrentSession = onUploadCurrentSession,
             uploadingSessions = uploadingSessions,
             isBleConnected = isBleConnected,
             modifier = Modifier.padding(innerPadding)
@@ -910,55 +519,58 @@ fun OdometerScreenWithTopBar(
 fun OdometerScreen(
     connectionStatus: String,
     odometerData: OdometerData,
-    displaySessionMiles: Float,
-    displaySessionTime: String,
-    displaySessionAvgSpeed: Float,
-    hasGroupedSessions: Boolean,
-    sessionGroups: List<SessionGroup>,
-    onUploadGroup: (SessionGroup) -> Unit,
-    onDiscardGroup: (SessionGroup) -> Unit,
+    unreportedSessions: List<SessionRecord>,
+    onUploadSessions: (List<SessionRecord>) -> Unit,
+    onDiscardSession: (SessionRecord) -> Unit,
     stravaAuthenticated: Boolean,
-    onUploadCurrentSession: () -> Unit,
     uploadingSessions: Set<Int>,
     isBleConnected: Boolean,
     modifier: Modifier = Modifier
 ) {
-    var groupToConfirmDelete by remember { mutableStateOf<SessionGroup?>(null) }
+    var selectedSessions by remember { mutableStateOf<Set<Int>>(emptySet()) }
+    var showDiscardConfirmation by remember { mutableStateOf(false) }
 
-    groupToConfirmDelete?.let { group ->
-        val sessionCountText = if (group.sessions.size == 1) "1 session" else "${group.sessions.size} sessions"
+    if (showDiscardConfirmation) {
+        val selectedSessionsList = unreportedSessions.filter { it.sessionId in selectedSessions }
+        val totalMiles = selectedSessionsList.sumOf { it.miles.toDouble() }.toFloat()
+        val totalSeconds = selectedSessionsList.sumOf { it.activeTimeSeconds }
+        val sessionCountText = if (selectedSessionsList.size == 1) "1 session" else "${selectedSessionsList.size} sessions"
+
         AlertDialog(
-            onDismissRequest = { groupToConfirmDelete = null },
+            onDismissRequest = { showDiscardConfirmation = false },
             title = { Text("Discard Sessions?") },
             text = {
-                Text("This will permanently delete $sessionCountText (${String.format("%.2f %s", group.miles, odometerData.distanceUnit)}, ${group.formattedTime}) without uploading it anywhere. This cannot be undone.")
+                Text("This will permanently delete $sessionCountText (${String.format("%.2f %s", totalMiles, odometerData.distanceUnit)}, ${formatTimeFromSeconds(totalSeconds)}) without uploading them anywhere. This cannot be undone.")
             },
             confirmButton = {
                 TextButton(
                     onClick = {
-                        onDiscardGroup(group)
-                        groupToConfirmDelete = null
+                        selectedSessionsList.forEach { onDiscardSession(it) }
+                        selectedSessions = emptySet()
+                        showDiscardConfirmation = false
                     }
                 ) {
                     Text("Discard")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { groupToConfirmDelete = null }) {
+                TextButton(onClick = { showDiscardConfirmation = false }) {
                     Text("Cancel")
                 }
             }
         )
     }
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Top
-    ) {
+    Box(modifier = modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp)
+                .padding(bottom = if (selectedSessions.isNotEmpty()) 80.dp else 0.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Top
+        ) {
         Text(
             text = connectionStatus,
             fontSize = 14.sp,
@@ -988,7 +600,7 @@ fun OdometerScreen(
             modifier = Modifier.padding(top = 24.dp)
         )
         Text(
-            text = String.format("%.2f %s", displaySessionAvgSpeed, odometerData.speedUnit),
+            text = String.format("%.2f %s", odometerData.sessionAvgSpeed, odometerData.speedUnit),
             fontSize = 36.sp,
             fontWeight = FontWeight.SemiBold
         )
@@ -999,26 +611,12 @@ fun OdometerScreen(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.Start
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Session",
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
-                if (hasGroupedSessions) {
-                    Text(
-                        text = "includes previous",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.secondary,
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
-                }
-            }
+            Text(
+                text = "Session",
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1027,7 +625,7 @@ fun OdometerScreen(
             ) {
                 Text(text = "Distance:", fontSize = 18.sp)
                 Text(
-                    text = String.format("%.2f %s", displaySessionMiles, odometerData.distanceUnit),
+                    text = String.format("%.2f %s", odometerData.sessionMiles, odometerData.distanceUnit),
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Medium
                 )
@@ -1040,32 +638,10 @@ fun OdometerScreen(
             ) {
                 Text(text = "Time:", fontSize = 18.sp)
                 Text(
-                    text = displaySessionTime,
+                    text = odometerData.sessionTime,
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Medium
                 )
-            }
-
-            val canUploadCurrentSession = stravaAuthenticated &&
-                odometerData.sessionId > 0 &&
-                odometerData.sessionRotations > 0 &&
-                (!isBleConnected || odometerData.runningAvgSpeed == 0f)
-
-            if (canUploadCurrentSession) {
-                val isUploading = odometerData.sessionId in uploadingSessions
-                Button(
-                    onClick = onUploadCurrentSession,
-                    enabled = !isUploading,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp)
-                ) {
-                    if (isUploading) {
-                        Text("Uploading...")
-                    } else {
-                        Text("Upload to Strava")
-                    }
-                }
             }
 
             Text(
@@ -1113,7 +689,7 @@ fun OdometerScreen(
                 )
             }
 
-            if (sessionGroups.isNotEmpty()) {
+            if (unreportedSessions.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(24.dp))
                 Divider(modifier = Modifier.padding(vertical = 8.dp))
 
@@ -1124,105 +700,105 @@ fun OdometerScreen(
                     modifier = Modifier.padding(bottom = 12.dp, top = 8.dp)
                 )
 
-                sessionGroups.forEach { group ->
+                unreportedSessions.sortedByDescending { it.sessionId }.forEach { session ->
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(vertical = 4.dp)
+                            .padding(vertical = 2.dp),
+                        onClick = {
+                            selectedSessions = if (session.sessionId in selectedSessions) {
+                                selectedSessions - session.sessionId
+                            } else {
+                                selectedSessions + session.sessionId
+                            }
+                        }
                     ) {
-                        Column(
+                        Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(12.dp)
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            // Show date range
-                            Text(
-                                text = "${group.startDateStr} - ${group.endDateStr}",
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = MaterialTheme.colorScheme.primary
+                            androidx.compose.material3.Checkbox(
+                                checked = session.sessionId in selectedSessions,
+                                onCheckedChange = null  // Handled by Card onClick
                             )
 
-                            // Show session count if more than 1
-                            if (group.sessions.size > 1) {
-                                Text(
-                                    text = "(${group.sessions.size} sessions combined)",
-                                    fontSize = 12.sp,
-                                    color = MaterialTheme.colorScheme.secondary,
-                                    modifier = Modifier.padding(top = 2.dp)
-                                )
-                            }
+                            Text(
+                                text = session.endDateStr,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.weight(1f).padding(start = 8.dp)
+                            )
 
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(top = 8.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(text = "Walking time:", fontSize = 14.sp)
-                                Text(text = group.formattedTime, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                            }
+                            Text(
+                                text = session.formattedTime,
+                                fontSize = 14.sp,
+                                modifier = Modifier.padding(start = 12.dp)
+                            )
 
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(top = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(text = "Distance:", fontSize = 14.sp)
-                                Text(text = String.format("%.2f %s", group.miles, odometerData.distanceUnit), fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                            }
-
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(top = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(text = "Avg speed:", fontSize = 14.sp)
-                                Text(text = String.format("%.2f mph", group.avgSpeed), fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                            }
-
-                            // Check if any session in the group is uploading
-                            val isUploading = group.sessionIds.any { it in uploadingSessions }
-
-                            if (stravaAuthenticated) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(top = 8.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    Button(
-                                        onClick = { onUploadGroup(group) },
-                                        enabled = !isUploading,
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Text(if (isUploading) "Uploading..." else "Upload")
-                                    }
-
-                                    OutlinedButton(
-                                        onClick = { groupToConfirmDelete = group },
-                                        enabled = !isUploading,
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Text("Discard")
-                                    }
-                                }
-                            } else {
-                                Button(
-                                    onClick = { groupToConfirmDelete = group },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(top = 8.dp)
-                                ) {
-                                    Text("Clear Session${if (group.sessions.size > 1) "s" else ""}")
-                                }
-                            }
+                            Text(
+                                text = String.format("%.2f %s", session.miles, odometerData.distanceUnit),
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.padding(start = 12.dp)
+                            )
                         }
                     }
                 }
             }
         }
+    }  // End of Column
+
+    // Bottom action bar when sessions are selected
+    if (selectedSessions.isNotEmpty()) {
+        androidx.compose.material3.Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.BottomCenter),
+            shadowElevation = 8.dp,
+            tonalElevation = 2.dp
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                if (stravaAuthenticated) {
+                    Button(
+                        onClick = {
+                            val selectedSessionsList = unreportedSessions.filter { it.sessionId in selectedSessions }
+                            if (selectedSessionsList.isNotEmpty()) {
+                                onUploadSessions(selectedSessionsList)
+                                selectedSessions = emptySet()
+                            }
+                        },
+                        enabled = selectedSessions.none { it in uploadingSessions },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        val isUploading = selectedSessions.any { it in uploadingSessions }
+                        Text(if (isUploading) "Uploading..." else "Send to Strava (${selectedSessions.size})")
+                    }
+
+                    OutlinedButton(
+                        onClick = { showDiscardConfirmation = true },
+                        enabled = selectedSessions.none { it in uploadingSessions },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Discard (${selectedSessions.size})")
+                    }
+                } else {
+                    Button(
+                        onClick = { showDiscardConfirmation = true },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Clear (${selectedSessions.size})")
+                    }
+                }
+            }
+        }
     }
+}  // End of Box
 }
