@@ -8,6 +8,7 @@
 #include "hardware/i2c.h"
 #include "hardware/clocks.h"
 #include "odometer.h"
+#include "irq.h"
 #include "oled.h"
 #include "font.h"
 #include "icons.h"
@@ -29,12 +30,10 @@
 #define SENSOR_PIN 21
 #endif
 
-#ifndef POLL_DELAY_MS
-// Polling interval calculated for 8 mph with 3 polls per revolution:
-// - 8 mph = 37,260 rotations/hour = 10.35 rot/sec = 96.6 ms/rotation
-// - 3 polls per rotation = 96.6 ms / 3 = 32.2 ms
-// - Using 30 ms for safety margin (~3.2 polls per rotation at 8 mph)
-#define POLL_DELAY_MS 30
+#ifndef MAIN_LOOP_DELAY_MS
+// Main loop delay - no longer needs to be fast since we use IRQ for rotation detection
+// Set to 100ms for responsive active time tracking and display updates while saving power
+#define MAIN_LOOP_DELAY_MS 100
 #endif
 
 // Debug mode: simulate rotations at ~2 MPH
@@ -373,9 +372,9 @@ static hci_con_handle_t connection_handle;
 // ATT_CHARACTERISTIC_12345678_1234_5678_1234_56789ABCDEF1_01_VALUE_HANDLE
 
 // BLE activation delay tracking (requires voltage to be stable for 15 seconds)
-#define BLE_ACTIVATION_DELAY_MS 15000  // 15 seconds
-static uint32_t ble_voltage_above_threshold_start_ms = 0;  // When voltage first went above threshold
-static bool ble_voltage_is_above_threshold = false;        // Current voltage state
+#define BLE_ACTIVATION_DELAY_MS 15000                     // 15 seconds
+static uint32_t ble_voltage_above_threshold_start_ms = 0; // When voltage first went above threshold
+static bool ble_voltage_is_above_threshold = false;       // Current voltage state
 
 // Connection status is now integrated into update_oled_session() and update_oled_totals()
 
@@ -917,9 +916,13 @@ int main()
     log_printf("Initializing OLED display...\n");
     oled_init(OLED_I2C_PORT, OLED_SDA_PIN, OLED_SCL_PIN, OLED_ADDR);
 
-    // Initialize odometer sensor
-    log_printf("Initializing odometer sensor on pin %d...\n", SENSOR_PIN);
-    odometer_init(SENSOR_PIN);
+    // Initialize odometer (loads flash data, initializes ADC)
+    log_printf("Initializing odometer...\n");
+    odometer_init();
+
+    // Initialize rotation detection IRQ
+    log_printf("Initializing rotation detection on pin %d...\n", SENSOR_PIN);
+    irq_init(SENSOR_PIN);
 
     // Show startup message (centered, 12pt to fit on screen)
     oled_clear();
@@ -935,9 +938,6 @@ int main()
     oled_update();
 
     sleep_ms(2000); // Show startup screen for 2 seconds
-
-    // Set LED callback for visual feedback
-    odometer_set_led_callback(pico_set_led);
 
     // Enable voltage-based flash save: only save when voltage drops below 3.3V
     // This extends flash lifetime when powered by supercapacitor/generator
@@ -979,12 +979,9 @@ int main()
         }
 #endif
 
-        // Process sensor reading
+        // Process sensor readings (handles IRQ-detected rotations)
+        // LED control is handled directly in the GPIO IRQ handler
         bool rotation_detected = odometer_process();
-
-        // Sync LED with sensor state for visual feedback
-        bool sensor_state = gpio_get(SENSOR_PIN);
-        pico_set_led(sensor_state);
 
         // Check voltage periodically and control BLE and OLED
         if ((current_time_ms - last_voltage_check_ms) >= VOLTAGE_CHECK_INTERVAL_MS)
@@ -1042,13 +1039,6 @@ int main()
                         log_printf("*** STARTING BLE ADVERTISING (voltage stable at %u mV for %lu ms) ***\n",
                                    voltage_mv, time_above_threshold_ms);
                         start_ble_advertising();
-                    }
-                    else
-                    {
-                        // Still waiting for the delay to complete
-                        uint32_t remaining_ms = BLE_ACTIVATION_DELAY_MS - time_above_threshold_ms;
-                        log_printf("Voltage stable above threshold for %lu ms, %lu ms remaining before BLE starts\n",
-                                   time_above_threshold_ms, remaining_ms);
                     }
                 }
             }
@@ -1131,6 +1121,6 @@ int main()
             }
         }
 
-        sleep_ms(POLL_DELAY_MS);
+        sleep_ms(MAIN_LOOP_DELAY_MS);
     }
 }

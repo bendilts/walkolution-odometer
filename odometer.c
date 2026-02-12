@@ -5,8 +5,8 @@
 #include "odometer.h"
 #include "flash.h"
 #include "logging.h"
+#include "irq.h"
 #include "pico/stdlib.h"
-#include "hardware/gpio.h"
 #include "hardware/flash.h"
 #include "hardware/adc.h"
 #include <string.h>
@@ -41,17 +41,6 @@ typedef struct
 
 typedef struct
 {
-    uint8_t sensor_pin;
-    bool last_sensor_state;
-} sensor_state_t;
-
-typedef struct
-{
-    led_callback_t led_callback;
-} callbacks_t;
-
-typedef struct
-{
     bool voltage_save_enabled;
     uint16_t voltage_threshold_mv;
     uint32_t last_saved_count;
@@ -61,8 +50,6 @@ typedef struct
 // Global state instances
 static odometer_counts_t counts = {0};
 static session_state_t session = {0};
-static sensor_state_t sensor = {0};
-static callbacks_t callbacks = {0};
 static save_state_t save_state = {0};
 
 // Track the highest session ID and write_index seen (for creating new sessions/writes)
@@ -291,13 +278,9 @@ void odometer_save_count(void)
     log_printf("[FLASH WRITE] ✓ Flash write completed successfully\n");
 }
 
-void odometer_init(uint8_t pin)
+void odometer_init(void)
 {
-    sensor.sensor_pin = pin;
-    gpio_init(sensor.sensor_pin);
-    gpio_set_dir(sensor.sensor_pin, GPIO_IN);
-    gpio_pull_up(sensor.sensor_pin); // Enable internal pull-up resistor
-    sensor.last_sensor_state = gpio_get(sensor.sensor_pin);
+    // Note: Sensor IRQ initialization happens in main application via irq_init()
 
     // Initialize ADC for voltage monitoring
     adc_init();
@@ -321,16 +304,20 @@ void odometer_init(uint8_t pin)
     log_printf("[SESSION] Starting new session ID: %lu\n", session.current_session_id);
 }
 
-void odometer_set_led_callback(led_callback_t callback)
-{
-    callbacks.led_callback = callback;
-}
-
 bool odometer_process(void)
 {
-    bool sensor_high = gpio_get(sensor.sensor_pin);
     bool rotation_detected = false;
     uint32_t current_time_ms = to_ms_since_boot(get_absolute_time());
+
+    // Read and clear pending rotations from IRQ module
+    uint32_t rotations_to_process = irq_read_and_clear_rotations();
+
+    // Process each pending rotation
+    for (uint32_t i = 0; i < rotations_to_process; i++)
+    {
+        odometer_add_rotation();
+        rotation_detected = true;
+    }
 
     // Update active time tracking
     // If currently active, check for timeout (3 seconds since last rotation)
@@ -343,56 +330,6 @@ bool odometer_process(void)
             counts.lifetime_active_seconds += elapsed_seconds;
             counts.session_active_seconds += elapsed_seconds;
             counts.is_active = false;
-        }
-    }
-
-    // Check voltage if voltage-based saving is enabled
-    // Save immediately if voltage drops below threshold (power loss imminent)
-    if (save_state.voltage_save_enabled)
-    {
-        uint16_t vsys_mv = odometer_read_voltage();
-        if (vsys_mv <= save_state.voltage_threshold_mv)
-        {
-            // Voltage is low - save immediately before potential power loss
-            // (only if count has changed and at least 1 minute since last save)
-            if (counts.lifetime_rotations != save_state.last_saved_count &&
-                (current_time_ms - save_state.last_save_time_ms) >= FLASH_SAVE_INTERVAL_MS)
-            {
-                odometer_save_count();
-            }
-        }
-    }
-
-    // Simple edge detection - detect state changes from the latching Hall Effect sensor
-    // Each edge represents a half-rotation (sensor toggles on each magnet pass)
-    if (sensor_high != sensor.last_sensor_state)
-    {
-        sensor.last_sensor_state = sensor_high;
-
-        // Every edge is a half-rotation, so count every 2 edges as 1 full rotation
-        // We'll count on falling edges (sensor goes LOW)
-        if (!sensor_high)
-        {
-            // Complete rotation detected!
-            counts.lifetime_rotations++;
-            counts.session_rotations++;
-            rotation_detected = true;
-
-            // Update active time tracking
-            counts.last_rotation_time_ms = current_time_ms;
-            if (!counts.is_active)
-            {
-                // Starting a new active period
-                counts.active_start_time_ms = current_time_ms;
-                counts.is_active = true;
-            }
-
-            // Check if we should save to flash based on rotation count
-            // Save every ROTATION_SAVE_INTERVAL rotations (2500 = ~0.5 miles)
-            if ((counts.lifetime_rotations - save_state.last_saved_count) >= ROTATION_SAVE_INTERVAL)
-            {
-                odometer_save_count();
-            }
         }
     }
 
@@ -471,6 +408,23 @@ void odometer_add_rotation(void)
     if ((counts.lifetime_rotations - save_state.last_saved_count) >= ROTATION_SAVE_INTERVAL)
     {
         odometer_save_count();
+    }
+
+    // Check voltage if voltage-based saving is enabled
+    // Save immediately if voltage drops below threshold (power loss imminent)
+    if (save_state.voltage_save_enabled)
+    {
+        uint16_t vsys_mv = odometer_read_voltage();
+        if (vsys_mv <= save_state.voltage_threshold_mv)
+        {
+            // Voltage is low - save immediately before potential power loss
+            // (only if count has changed and at least 1 minute since last save)
+            if (counts.lifetime_rotations != save_state.last_saved_count &&
+                (current_time_ms - save_state.last_save_time_ms) >= FLASH_SAVE_INTERVAL_MS)
+            {
+                odometer_save_count();
+            }
+        }
     }
 }
 

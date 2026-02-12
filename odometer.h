@@ -8,18 +8,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Callback function type for LED control
-typedef void (*led_callback_t)(bool on);
+// Initialize the odometer (loads flash data, initializes ADC)
+void odometer_init(void);
 
-// Initialize the odometer sensor
-void odometer_init(uint8_t sensor_pin);
-
-// Set LED callback for visual feedback
-void odometer_set_led_callback(led_callback_t callback);
-
-// Process sensor readings (simple edge detection, no debouncing)
-// Returns true if a new rotation was detected
-// Call at polling rate appropriate for your max speed (e.g., 30ms for 8mph)
+// Process sensor readings and handle pending rotations from IRQ
+// Uses GPIO interrupt for edge detection (no polling required)
+// Returns true if any new rotations were processed
+// Call regularly to process IRQ events and update active time tracking
 bool odometer_process(void);
 
 // Get the total number of rotations (all-time)
@@ -47,7 +42,8 @@ void odometer_disable_voltage_save(void);
 // Read current VSYS voltage in millivolts
 uint16_t odometer_read_voltage(void);
 
-// Debug: manually add a rotation (for testing without sensor)
+// Manually add a rotation (for testing without sensor, or called by odometer_process)
+// This is the main rotation processing function, handling all rotation logic
 void odometer_add_rotation(void);
 
 // Session management structures and functions
