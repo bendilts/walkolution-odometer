@@ -144,6 +144,11 @@ class MainActivity : ComponentActivity() {
     private var unreportedSessions = mutableStateOf<List<SessionRecord>>(emptyList())
     private var isConnected = mutableStateOf(false)
 
+    // BLE queue status
+    private var bleQueueSize = mutableStateOf(0)
+    private var bleProcessing = mutableStateOf(false)
+    private var bleLastError = mutableStateOf<String?>(null)
+
     // Strava integration
     private lateinit var stravaRepository: StravaRepository
     private var stravaAuthenticated = mutableStateOf(false)
@@ -190,6 +195,21 @@ class MainActivity : ComponentActivity() {
             lifecycleScope.launch {
                 bleService?.isConnected?.collect { connected ->
                     isConnected.value = connected
+                }
+            }
+            lifecycleScope.launch {
+                bleService?.bleQueueSize?.collect { size ->
+                    bleQueueSize.value = size
+                }
+            }
+            lifecycleScope.launch {
+                bleService?.bleProcessing?.collect { processing ->
+                    bleProcessing.value = processing
+                }
+            }
+            lifecycleScope.launch {
+                bleService?.bleLastError?.collect { error ->
+                    bleLastError.value = error
                 }
             }
         }
@@ -239,6 +259,9 @@ class MainActivity : ComponentActivity() {
                     stravaAuthenticated = stravaAuthenticated.value,
                     uploadingSessions = uploadingSessions.value,
                     isBleConnected = isConnected.value,
+                    bleQueueSize = bleQueueSize.value,
+                    bleProcessing = bleProcessing.value,
+                    bleLastError = bleLastError.value,
                     onOpenSettings = { openSettings() },
                     onOpenSetLifetimeTotals = { openSetLifetimeTotals() },
                     onOpenStravaSettings = { openStravaSettings() },
@@ -362,11 +385,12 @@ class MainActivity : ComponentActivity() {
                             elapsedTimeSeconds = session.activeTimeSeconds
                         )
                     )
+                }
 
-                    // If BLE is connected, send confirmation to Pico for EACH session
-                    if (isConnected.value) {
-                        markSessionReported(session.sessionId)
-                    }
+                // If BLE is connected, send confirmations to Pico in batch
+                if (isConnected.value) {
+                    val sessionIdsToMark = sessions.map { it.sessionId }
+                    bleService?.markMultipleSessionsReported(sessionIdsToMark)
                 }
 
                 // Remove ALL sessions from displayed list
@@ -442,6 +466,9 @@ fun OdometerScreenWithTopBar(
     stravaAuthenticated: Boolean,
     uploadingSessions: Set<Int>,
     isBleConnected: Boolean,
+    bleQueueSize: Int,
+    bleProcessing: Boolean,
+    bleLastError: String?,
     onOpenSettings: () -> Unit,
     onOpenSetLifetimeTotals: () -> Unit,
     onOpenStravaSettings: () -> Unit,
@@ -515,6 +542,9 @@ fun OdometerScreenWithTopBar(
             stravaAuthenticated = stravaAuthenticated,
             uploadingSessions = uploadingSessions,
             isBleConnected = isBleConnected,
+            bleQueueSize = bleQueueSize,
+            bleProcessing = bleProcessing,
+            bleLastError = bleLastError,
             modifier = Modifier.padding(innerPadding)
         )
     }
@@ -530,6 +560,9 @@ fun OdometerScreen(
     stravaAuthenticated: Boolean,
     uploadingSessions: Set<Int>,
     isBleConnected: Boolean,
+    bleQueueSize: Int,
+    bleProcessing: Boolean,
+    bleLastError: String?,
     modifier: Modifier = Modifier
 ) {
     var selectedSessions by remember { mutableStateOf<Set<Int>>(emptySet()) }
@@ -612,8 +645,28 @@ fun OdometerScreen(
             text = connectionStatus,
             fontSize = 14.sp,
             color = if (connectionStatus == "Connected") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-            modifier = Modifier.padding(top = 8.dp, bottom = 16.dp)
+            modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
         )
+
+        // BLE Queue Status (only show if queue is active or there's an error)
+        if (bleQueueSize > 0 || bleProcessing || bleLastError != null) {
+            Text(
+                text = buildString {
+                    if (bleProcessing) append("Processing")
+                    if (bleQueueSize > 0) {
+                        if (isNotEmpty()) append(" • ")
+                        append("$bleQueueSize queued")
+                    }
+                    if (bleLastError != null) {
+                        if (isNotEmpty()) append(" • ")
+                        append("Error")
+                    }
+                },
+                fontSize = 12.sp,
+                color = if (bleLastError != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.secondary,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
+        }
 
         Divider(modifier = Modifier.padding(vertical = 8.dp))
 

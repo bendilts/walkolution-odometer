@@ -89,6 +89,16 @@ class BleService : Service() {
     private val _logMessages = MutableStateFlow<String>("")
     val logMessages: StateFlow<String> = _logMessages.asStateFlow()
 
+    // BLE queue status observables
+    private val _bleQueueSize = MutableStateFlow(0)
+    val bleQueueSize: StateFlow<Int> = _bleQueueSize.asStateFlow()
+
+    private val _bleProcessing = MutableStateFlow(false)
+    val bleProcessing: StateFlow<Boolean> = _bleProcessing.asStateFlow()
+
+    private val _bleLastError = MutableStateFlow<String?>(null)
+    val bleLastError: StateFlow<String?> = _bleLastError.asStateFlow()
+
     // Notification
     private lateinit var notificationManager: NotificationManager
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -1040,8 +1050,18 @@ class BleService : Service() {
                     }
                 }
             } else {
-                Log.w(TAG, "Characteristic write failed: ${characteristic.uuid}, status=$status")
-                completeBleRequest()
+                val errorMsg = getGattErrorMessage(status)
+                // Failed write - use retry logic for MARK_REPORTED
+                when (characteristic.uuid) {
+                    MARK_REPORTED_CHARACTERISTIC_UUID -> {
+                        Log.w(TAG, "Mark reported write failed: $errorMsg (status=$status)")
+                        failBleRequest("Write failed: $errorMsg")
+                    }
+                    else -> {
+                        Log.w(TAG, "Characteristic write failed for ${characteristic.uuid}: $errorMsg (status=$status)")
+                        completeBleRequest()
+                    }
+                }
             }
         }
 
@@ -1065,10 +1085,14 @@ class BleService : Service() {
                     }
                 }
             } else {
-                Log.w(TAG, "Characteristic read failed: ${characteristic.uuid}, status=$status")
+                val errorMsg = getGattErrorMessage(status)
+                Log.w(TAG, "Characteristic read failed for ${characteristic.uuid}: $errorMsg (status=$status)")
                 // Complete request even on failure to avoid queue getting stuck
                 when (characteristic.uuid) {
-                    SESSIONS_LIST_CHARACTERISTIC_UUID, USER_SETTINGS_CHARACTERISTIC_UUID -> completeBleRequest()
+                    SESSIONS_LIST_CHARACTERISTIC_UUID, USER_SETTINGS_CHARACTERISTIC_UUID -> {
+                        _bleLastError.value = "Read ${characteristic.uuid} failed: $errorMsg"
+                        completeBleRequest()
+                    }
                 }
             }
         }
@@ -1099,10 +1123,14 @@ class BleService : Service() {
                     }
                 } ?: Log.w(TAG, "Characteristic value is null")
             } else {
-                Log.w(TAG, "Characteristic read failed: ${characteristic.uuid}, status=$status")
+                val errorMsg = getGattErrorMessage(status)
+                Log.w(TAG, "Characteristic read failed for ${characteristic.uuid}: $errorMsg (status=$status)")
                 // Complete request even on failure to avoid queue getting stuck
                 when (characteristic.uuid) {
-                    SESSIONS_LIST_CHARACTERISTIC_UUID, USER_SETTINGS_CHARACTERISTIC_UUID -> completeBleRequest()
+                    SESSIONS_LIST_CHARACTERISTIC_UUID, USER_SETTINGS_CHARACTERISTIC_UUID -> {
+                        _bleLastError.value = "Read ${characteristic.uuid} failed: $errorMsg"
+                        completeBleRequest()
+                    }
                 }
             }
         }
@@ -1471,9 +1499,29 @@ class BleService : Service() {
     }
 
     // Public API to mark session reported (queues the request)
-    fun markSessionReported(sessionId: Int) {
+    fun markSessionReported(sessionId: Int, refreshAfter: Boolean = true) {
         enqueueBleRequest(BleRequest.MarkSessionReported(sessionId))
-        // Also queue a sessions list read to refresh the list
+        if (refreshAfter) {
+            // Also queue a sessions list read to refresh the list
+            enqueueBleRequest(BleRequest.ReadSessionsList)
+        }
+    }
+
+    // Public API to mark multiple sessions reported in batch (more efficient)
+    fun markMultipleSessionsReported(sessionIds: List<Int>) {
+        if (sessionIds.isEmpty()) {
+            Log.d(TAG, "markMultipleSessionsReported called with empty list")
+            return
+        }
+
+        Log.i(TAG, "Marking ${sessionIds.size} sessions as reported in batch")
+
+        // Queue all mark reported requests without individual refreshes
+        sessionIds.forEach { sessionId ->
+            enqueueBleRequest(BleRequest.MarkSessionReported(sessionId))
+        }
+
+        // Queue a single refresh at the end
         enqueueBleRequest(BleRequest.ReadSessionsList)
     }
 
@@ -1775,15 +1823,45 @@ class BleService : Service() {
         object ReadUserSettings : BleRequest()
         object ReadSessionsList : BleRequest()
         object StartLogPolling : BleRequest()
-        data class MarkSessionReported(val sessionId: Int) : BleRequest()
+        data class MarkSessionReported(val sessionId: Int, val retryCount: Int = 0) : BleRequest()
         data class WriteUserSettings(val metric: Boolean) : BleRequest()
     }
     private val bleRequestQueue = mutableListOf<BleRequest>()
     private var processingBleRequest = false
+    private var currentRequest: BleRequest? = null
+
+    // Retry configuration
+    private val MAX_RETRIES = 3
+    private val RETRY_DELAYS = listOf(1000L, 2000L, 4000L)
+
+    // Timeout protection
+    private val BLE_REQUEST_TIMEOUT_MS = 10000L  // 10 seconds
+    private var requestTimeoutRunnable: Runnable? = null
+
+    // Helper function to map GATT status codes to human-readable messages
+    private fun getGattErrorMessage(status: Int): String {
+        return when (status) {
+            BluetoothGatt.GATT_SUCCESS -> "Success"
+            BluetoothGatt.GATT_READ_NOT_PERMITTED -> "Read not permitted"
+            BluetoothGatt.GATT_WRITE_NOT_PERMITTED -> "Write not permitted"
+            BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION -> "Insufficient authentication"
+            BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED -> "Request not supported"
+            BluetoothGatt.GATT_INSUFFICIENT_ENCRYPTION -> "Insufficient encryption"
+            BluetoothGatt.GATT_INVALID_OFFSET -> "Invalid offset"
+            BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH -> "Invalid attribute length"
+            BluetoothGatt.GATT_CONNECTION_CONGESTED -> "Connection congested"
+            BluetoothGatt.GATT_FAILURE -> "Generic failure"
+            133 -> "GATT_ERROR (connection lost)"
+            8 -> "GATT_INSUF_AUTHORIZATION"
+            137 -> "GATT_ILLEGAL_PARAMETER"
+            else -> "Unknown error (code $status)"
+        }
+    }
 
     // Enqueue a BLE request and process if not already processing
     private fun enqueueBleRequest(request: BleRequest) {
         bleRequestQueue.add(request)
+        _bleQueueSize.value = bleRequestQueue.size
         Log.d(TAG, "Enqueued BLE request: ${request::class.simpleName}, queue size: ${bleRequestQueue.size}")
         processNextBleRequest()
     }
@@ -1797,19 +1875,28 @@ class BleService : Service() {
 
         if (bleRequestQueue.isEmpty()) {
             Log.v(TAG, "BLE request queue is empty")
+            _bleProcessing.value = false
             return
         }
 
         if (!_isConnected.value || !notificationsEnabled) {
             Log.w(TAG, "Not connected or notifications disabled (connected=${_isConnected.value}, notificationsEnabled=$notificationsEnabled), clearing queue (${bleRequestQueue.size} items)")
             bleRequestQueue.clear()
+            _bleQueueSize.value = 0
             processingBleRequest = false
+            _bleProcessing.value = false
             return
         }
 
         processingBleRequest = true
+        _bleProcessing.value = true
         val request = bleRequestQueue.removeAt(0)
+        _bleQueueSize.value = bleRequestQueue.size
+        currentRequest = request
         Log.i(TAG, "Processing BLE request: ${request::class.simpleName}, ${bleRequestQueue.size} remaining")
+
+        // Start timeout watchdog
+        startRequestTimeout()
 
         when (request) {
             is BleRequest.SendTimeSync -> executeSendTimeSync()
@@ -1821,13 +1908,81 @@ class BleService : Service() {
         }
     }
 
+    // Start timeout watchdog for current request
+    private fun startRequestTimeout() {
+        cancelRequestTimeout()
+        requestTimeoutRunnable = Runnable {
+            Log.e(TAG, "BLE request timeout after ${BLE_REQUEST_TIMEOUT_MS}ms")
+            failBleRequest("Request timeout after ${BLE_REQUEST_TIMEOUT_MS}ms")
+        }
+        mainHandler.postDelayed(requestTimeoutRunnable!!, BLE_REQUEST_TIMEOUT_MS)
+    }
+
+    // Cancel timeout watchdog
+    private fun cancelRequestTimeout() {
+        requestTimeoutRunnable?.let {
+            mainHandler.removeCallbacks(it)
+            requestTimeoutRunnable = null
+        }
+    }
+
     // Mark the current BLE request as complete and process the next one
-    private fun completeBleRequest(delayMs: Long = 50) {
+    private fun completeBleRequest(delayMs: Long = 150) {
         Log.d(TAG, "BLE request complete, scheduling next after ${delayMs}ms")
+        cancelRequestTimeout()
+        currentRequest = null
         processingBleRequest = false
         mainHandler.postDelayed({
             processNextBleRequest()
         }, delayMs)
+    }
+
+    // Handle BLE request failure with retry logic
+    private fun failBleRequest(reason: String) {
+        cancelRequestTimeout()
+
+        val request = currentRequest
+        if (request == null) {
+            Log.w(TAG, "BLE request failed but no current request tracked: $reason")
+            _bleLastError.value = "Unknown request failed: $reason"
+            processingBleRequest = false
+            processNextBleRequest()
+            return
+        }
+
+        // Only retry MarkSessionReported requests
+        if (request is BleRequest.MarkSessionReported && request.retryCount < MAX_RETRIES) {
+            val retryDelay = RETRY_DELAYS.getOrElse(request.retryCount) { RETRY_DELAYS.last() }
+            Log.w(TAG, "BLE request failed (attempt ${request.retryCount + 1}/$MAX_RETRIES): $reason. Retrying in ${retryDelay}ms...")
+            _bleLastError.value = "MarkSessionReported(${request.sessionId}) attempt ${request.retryCount + 1} failed: $reason"
+
+            // Create a new request with incremented retry count
+            val retryRequest = request.copy(retryCount = request.retryCount + 1)
+
+            currentRequest = null
+            processingBleRequest = false
+
+            // Schedule retry
+            mainHandler.postDelayed({
+                // Add retry request to front of queue
+                bleRequestQueue.add(0, retryRequest)
+                _bleQueueSize.value = bleRequestQueue.size
+                processNextBleRequest()
+            }, retryDelay)
+        } else {
+            // No more retries or non-retryable request
+            if (request is BleRequest.MarkSessionReported && request.retryCount >= MAX_RETRIES) {
+                Log.e(TAG, "BLE request permanently failed after $MAX_RETRIES attempts: $reason")
+                _bleLastError.value = "MarkSessionReported(${request.sessionId}) permanently failed: $reason"
+            } else {
+                Log.w(TAG, "BLE request failed: $reason")
+                _bleLastError.value = "${request::class.simpleName} failed: $reason"
+            }
+
+            currentRequest = null
+            processingBleRequest = false
+            processNextBleRequest()
+        }
     }
 
     // Runnable for periodic log polling
