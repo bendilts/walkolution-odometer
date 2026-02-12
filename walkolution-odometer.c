@@ -873,12 +873,12 @@ int main()
     stdio_init_all();
     logging_init();
 
-    // // Underclock to 68 MHz for power savings (default is 125 MHz)
-    // // Going lower than 68 MHz may cause issues with USB/BLE/I2C peripherals
-    // log_printf("\n\n=== WALKOLUTION ODOMETER STARTING ===\n");
-    // log_printf("Underclocking system from 125 MHz to 68 MHz...\n");
-    // set_sys_clock_khz(68000, true); // 68 MHz = 68000 kHz, true = required
-    // log_printf("System clock: %lu Hz (%.1f MHz)\n", clock_get_hz(clk_sys), clock_get_hz(clk_sys) / 1000000.0f);
+    // Underclock to 68 MHz for power savings (default is 125 MHz)
+    // Going lower than 68 MHz may cause issues with USB/BLE/I2C peripherals
+    log_printf("\n\n=== WALKOLUTION ODOMETER STARTING ===\n");
+    log_printf("Underclocking system from 125 MHz to 68 MHz...\n");
+    set_sys_clock_khz(68000, true); // 68 MHz = 68000 kHz, true = required
+    log_printf("System clock: %lu Hz (%.1f MHz)\n", clock_get_hz(clk_sys), clock_get_hz(clk_sys) / 1000000.0f);
 
     int rc = pico_led_init();
     hard_assert(rc == PICO_OK);
