@@ -23,6 +23,12 @@
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
+    <!-- Wake lock to keep device awake during periodic connection attempts -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Request battery optimization exemption -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <application
@@ -92,6 +98,16 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- Periodic Connection Receiver -->
+        <receiver
+            android:name=".PeriodicConnectionReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.mypeople.walkolutionodometer.PERIODIC_CONNECTION_ATTEMPT" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

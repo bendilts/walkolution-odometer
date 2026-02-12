@@ -17,7 +17,9 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -29,6 +31,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.ActivityCompat
@@ -121,9 +124,6 @@ class BleService : Service() {
             if (action == BluetoothAdapter.ACTION_STATE_CHANGED) {
                 val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
                 handleBluetoothStateChange(state)
-            } else if (action == PERIODIC_CONNECTION_ACTION) {
-                Log.i(TAG, "Periodic connection alarm triggered")
-                handlePeriodicConnectionAttempt()
             }
         }
     }
@@ -169,11 +169,8 @@ class BleService : Service() {
 
         createNotificationChannel()
 
-        // Register Bluetooth state change receiver and periodic connection receiver
-        val filter = IntentFilter().apply {
-            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
-            addAction(PERIODIC_CONNECTION_ACTION)
-        }
+        // Register Bluetooth state change receiver
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(bluetoothStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -182,7 +179,8 @@ class BleService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.i(TAG, "BleService started")
+        val isPeriodicWakeup = intent?.getBooleanExtra("periodic_wakeup", false) ?: false
+        Log.i(TAG, "BleService started (periodic_wakeup=$isPeriodicWakeup)")
 
         // Start as foreground service
         val notification = createNotification()
@@ -213,8 +211,13 @@ class BleService : Service() {
         // Start watchdog to detect stuck states
         startWatchdog()
 
-        // Schedule periodic connection attempts
-        schedulePeriodicConnectionAttempts()
+        // Schedule periodic connection attempts (only once, not on every restart)
+        if (!isPeriodicWakeup) {
+            schedulePeriodicConnectionAttempts()
+        } else {
+            // This is a periodic wakeup, trigger connection attempt
+            handlePeriodicConnectionAttempt()
+        }
 
         return START_STICKY
     }
@@ -386,10 +389,14 @@ class BleService : Service() {
                 // Check if scanner is stuck (scanning flag is true but no callbacks received)
                 if (_scanning.value && scanStartTime > 0) {
                     val scanDuration = now - scanStartTime
-                    val timeSinceLastCallback = now - lastScanCallbackTime
+                    val timeSinceLastCallback = if (lastScanCallbackTime == 0L) {
+                        scanDuration  // Never received a callback, use scan duration
+                    } else {
+                        now - lastScanCallbackTime
+                    }
 
                     // If we've been "scanning" for >15 seconds with no callbacks, scanner is stuck
-                    if (scanDuration > 15000 && (lastScanCallbackTime == 0L || timeSinceLastCallback > 15000)) {
+                    if (scanDuration > 15000 && timeSinceLastCallback > 15000) {
                         Log.w(TAG, "Watchdog: Scanner stuck - scanning for ${scanDuration}ms but no callbacks for ${timeSinceLastCallback}ms")
                         _scanning.value = false
                         scanStartTime = 0
@@ -482,6 +489,9 @@ class BleService : Service() {
 
     // Schedule periodic connection attempts using AlarmManager (every 30 minutes)
     private fun schedulePeriodicConnectionAttempts() {
+        // Cancel any existing alarm first
+        cancelPeriodicConnectionAttempts()
+
         val intent = Intent(PERIODIC_CONNECTION_ACTION).apply {
             setPackage(packageName)
         }
@@ -494,27 +504,35 @@ class BleService : Service() {
         )
 
         // Schedule for every 30 minutes
-        val intervalMillis = 30 * 60 * 1000L // 30 minutes
+        val intervalMillis = 10 * 60 * 1000L // 30 minutes
         val triggerAtMillis = System.currentTimeMillis() + intervalMillis
 
         try {
-            // Use setExactAndAllowWhileIdle to work even in Doze mode
+            // Use setInexactRepeating for better battery life (works better with Doze mode)
+            // Android will batch alarms from different apps to wake the device less often
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setExactAndAllowWhileIdle(
+                // For Android M+, use setAndAllowWhileIdle for more reliable wakeups in Doze
+                // Note: This is a one-time alarm, so we need to reschedule after each wakeup
+                alarmManager.setAndAllowWhileIdle(
                     AlarmManager.RTC_WAKEUP,
                     triggerAtMillis,
                     periodicConnectionPendingIntent!!
                 )
+                Log.i(TAG, "Scheduled periodic connection attempt in 30 minutes (Doze-compatible, will reschedule after wakeup)")
             } else {
-                alarmManager.setExact(
+                // For older Android versions, use setInexactRepeating
+                alarmManager.setInexactRepeating(
                     AlarmManager.RTC_WAKEUP,
                     triggerAtMillis,
+                    intervalMillis,
                     periodicConnectionPendingIntent!!
                 )
+                Log.i(TAG, "Scheduled periodic connection attempts every 30 minutes (inexact repeating)")
             }
-            Log.i(TAG, "Scheduled periodic connection attempt in 30 minutes")
         } catch (e: SecurityException) {
             Log.e(TAG, "Failed to schedule periodic alarm: ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception scheduling periodic alarm: ${e.message}")
         }
     }
 
@@ -533,8 +551,10 @@ class BleService : Service() {
         Log.i(TAG, "=== PERIODIC CONNECTION ATTEMPT ===")
         Log.i(TAG, "Connected: ${_isConnected.value}, Connecting: $isConnecting, Scanning: ${_scanning.value}")
 
-        // Reschedule for next interval
-        schedulePeriodicConnectionAttempts()
+        // Reschedule for next interval (needed for setAndAllowWhileIdle on Android M+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            schedulePeriodicConnectionAttempts()
+        }
 
         // Only attempt connection if not already connected or connecting
         if (!_isConnected.value && !isConnecting) {
@@ -675,7 +695,10 @@ class BleService : Service() {
                 val scanRecord = result.scanRecord
                 val localName = scanRecord?.deviceName
 
-                Log.d(TAG, "Scan result: device=$deviceName, localName=$localName, address=${result.device.address}")
+                // Enhanced logging to track screen-off scan behavior
+                val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+                val isScreenOn = powerManager.isInteractive
+                Log.i(TAG, "🔍 Scan result (screen ${if (isScreenOn) "ON" else "OFF"}): device=$deviceName, localName=$localName, rssi=${result.rssi}, address=${result.device.address}")
 
                 val nameToCheck = localName ?: deviceName
                 if (nameToCheck == "Walk Odo" || nameToCheck == "Walkolution Odo") {
@@ -791,6 +814,7 @@ class BleService : Service() {
                 _isConnected.value = false
                 isConnecting = false
                 connectionAttemptStartTime = 0
+                notificationsEnabled = false
                 consecutiveFailures++
 
                 cleanupGatt()
@@ -1200,7 +1224,28 @@ class BleService : Service() {
         if (!_scanning.value) {
             Log.i(TAG, "Starting BLE scan...")
             try {
-                bluetoothLeScanner?.startScan(leScanCallback)
+                // Use scan settings optimized for background/screen-off operation
+                val scanSettings = ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)  // Low power mode for battery efficiency
+                    .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                    .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)  // Match more aggressively
+                    .setNumOfMatches(ScanSettings.MATCH_NUM_ONE_ADVERTISEMENT)
+                    .setReportDelay(0)  // Report immediately
+                    .build()
+
+                // CRITICAL: Use scan filters with device name to enable hardware offload filtering
+                // This allows the Bluetooth chip to continue scanning even when screen is off
+                val scanFilters = listOf(
+                    ScanFilter.Builder()
+                        .setDeviceName("Walk Odo")
+                        .build(),
+                    ScanFilter.Builder()
+                        .setDeviceName("Walkolution Odo")
+                        .build()
+                )
+
+                Log.i(TAG, "Starting scan with filters: Walk Odo, Walkolution Odo (enables screen-off scanning)")
+                bluetoothLeScanner?.startScan(scanFilters, scanSettings, leScanCallback)
                 _scanning.value = true
                 scanStartTime = System.currentTimeMillis()
                 lastScanCallbackTime = 0
@@ -1756,7 +1801,7 @@ class BleService : Service() {
         }
 
         if (!_isConnected.value || !notificationsEnabled) {
-            Log.w(TAG, "Not connected or notifications disabled, clearing queue")
+            Log.w(TAG, "Not connected or notifications disabled (connected=${_isConnected.value}, notificationsEnabled=$notificationsEnabled), clearing queue (${bleRequestQueue.size} items)")
             bleRequestQueue.clear()
             processingBleRequest = false
             return

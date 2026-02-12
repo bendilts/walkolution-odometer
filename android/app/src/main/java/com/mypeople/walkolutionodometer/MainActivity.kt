@@ -389,12 +389,17 @@ class MainActivity : ComponentActivity() {
 
     private fun discardSession(session: SessionRecord) {
         lifecycleScope.launch {
+            Log.i("MainActivity", "Discarding session ${session.sessionId}, connected=${isConnected.value}")
+
             // Mark session as discarded
             sessionCacheManager.addDiscardedSession(session.sessionId)
 
             // If BLE is connected, send the discard command immediately
             if (isConnected.value) {
+                Log.i("MainActivity", "Sending mark reported for discarded session ${session.sessionId}")
                 markSessionReported(session.sessionId)
+            } else {
+                Log.i("MainActivity", "Not connected - session ${session.sessionId} will be marked when reconnected")
             }
 
             // Remove session from displayed list immediately
@@ -529,6 +534,7 @@ fun OdometerScreen(
 ) {
     var selectedSessions by remember { mutableStateOf<Set<Int>>(emptySet()) }
     var showDiscardConfirmation by remember { mutableStateOf(false) }
+    var showStravaConfirmation by remember { mutableStateOf(false) }
 
     if (showDiscardConfirmation) {
         val selectedSessionsList = unreportedSessions.filter { it.sessionId in selectedSessions }
@@ -555,6 +561,37 @@ fun OdometerScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showDiscardConfirmation = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showStravaConfirmation) {
+        val selectedSessionsList = unreportedSessions.filter { it.sessionId in selectedSessions }
+        val totalMiles = selectedSessionsList.sumOf { it.miles.toDouble() }.toFloat()
+        val totalSeconds = selectedSessionsList.sumOf { it.activeTimeSeconds }
+        val sessionCountText = if (selectedSessionsList.size == 1) "1 session" else "${selectedSessionsList.size} sessions"
+
+        AlertDialog(
+            onDismissRequest = { showStravaConfirmation = false },
+            title = { Text("Send to Strava?") },
+            text = {
+                Text("Upload $sessionCountText (${String.format("%.2f %s", totalMiles, odometerData.distanceUnit)}, ${formatTimeFromSeconds(totalSeconds)}) to Strava?")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onUploadSessions(selectedSessionsList)
+                        selectedSessions = emptySet()
+                        showStravaConfirmation = false
+                    }
+                ) {
+                    Text("Upload")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showStravaConfirmation = false }) {
                     Text("Cancel")
                 }
             }
@@ -768,13 +805,7 @@ fun OdometerScreen(
             ) {
                 if (stravaAuthenticated) {
                     Button(
-                        onClick = {
-                            val selectedSessionsList = unreportedSessions.filter { it.sessionId in selectedSessions }
-                            if (selectedSessionsList.isNotEmpty()) {
-                                onUploadSessions(selectedSessionsList)
-                                selectedSessions = emptySet()
-                            }
-                        },
+                        onClick = { showStravaConfirmation = true },
                         enabled = selectedSessions.none { it in uploadingSessions },
                         modifier = Modifier.weight(1f)
                     ) {
