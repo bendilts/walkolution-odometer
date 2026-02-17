@@ -5,8 +5,13 @@
  */
 
 #include "pico/stdlib.h"
+#include "pico/sleep.h"
+#include "pico/runtime_init.h"
 #include "hardware/i2c.h"
 #include "hardware/clocks.h"
+#include "hardware/xosc.h"
+#include "hardware/rosc.h"
+
 #include "odometer.h"
 #include "irq.h"
 #include "oled.h"
@@ -69,6 +74,7 @@
 
 #define OLED_VOLTAGE_OFF_THRESHOLD_MV 3000 // 3.0V - turn off OLED below this
 #define OLED_VOLTAGE_ON_THRESHOLD_MV 3500  // 3.5V - turn on OLED above this (hysteresis prevents flickering)
+#define OLED_SPEED_OFF_THRESHOLD 1.5f      // Turn off OLED when speed is >0 but <1.5 mph/kph
 #define BLE_VOLTAGE_THRESHOLD_MV 4200      // 4.2V minimum for Bluetooth
 #define BLE_UPDATE_INTERVAL_MS 1000        // Send data to phone every second
 #define SPEED_WINDOW_SECONDS 5             // 5-second running average for speed
@@ -987,23 +993,38 @@ int main()
         if ((current_time_ms - last_voltage_check_ms) >= VOLTAGE_CHECK_INTERVAL_MS)
         {
             uint16_t voltage_mv = odometer_read_voltage();
+            float current_speed = calculate_running_avg_speed();
 
-            log_printf("[%lu] %u mV, BLE: adv=%d con=%d, OLED=%d\n",
-                       current_time_ms, voltage_mv, ble_advertising, ble_connected, oled_is_on);
+            log_printf("[%lu] %u mV, Speed: %.2f, BLE: adv=%d con=%d, OLED=%d\n",
+                       current_time_ms, voltage_mv, current_speed, ble_advertising, ble_connected, oled_is_on);
+
+            // Determine if speed allows OLED to be on
+            // OLED is allowed when: speed == 0 (stopped) OR speed >= 1.5 mph/kph
+            // OLED is NOT allowed when: 0 < speed < 1.5 mph/kph
+            bool speed_allows_oled = (current_speed == 0.0f) || (current_speed >= OLED_SPEED_OFF_THRESHOLD);
 
             // Control OLED power with hysteresis to prevent flickering
-            // Turn off at 3.0V, turn on at 3.5V
-            if (voltage_mv < OLED_VOLTAGE_OFF_THRESHOLD_MV && oled_is_on)
+            // Turn off when: voltage < 3.0V OR (0 < speed < 1.5)
+            // Turn on when: voltage >= 3.5V AND (speed == 0 OR speed >= 1.5)
+            if (oled_is_on && (voltage_mv < OLED_VOLTAGE_OFF_THRESHOLD_MV || !speed_allows_oled))
             {
-                log_printf("*** TURNING OFF OLED (voltage %u < %u) ***\n",
-                           voltage_mv, OLED_VOLTAGE_OFF_THRESHOLD_MV);
+                if (voltage_mv < OLED_VOLTAGE_OFF_THRESHOLD_MV)
+                {
+                    log_printf("*** TURNING OFF OLED (voltage %u < %u) ***\n",
+                               voltage_mv, OLED_VOLTAGE_OFF_THRESHOLD_MV);
+                }
+                else
+                {
+                    log_printf("*** TURNING OFF OLED (speed %.2f in restricted range 0 < speed < %.2f) ***\n",
+                               current_speed, OLED_SPEED_OFF_THRESHOLD);
+                }
                 oled_display_off();
                 oled_is_on = false;
             }
-            else if (voltage_mv >= OLED_VOLTAGE_ON_THRESHOLD_MV && !oled_is_on)
+            else if (!oled_is_on && voltage_mv >= OLED_VOLTAGE_ON_THRESHOLD_MV && speed_allows_oled)
             {
-                log_printf("*** TURNING ON OLED (voltage %u >= %u) ***\n",
-                           voltage_mv, OLED_VOLTAGE_ON_THRESHOLD_MV);
+                log_printf("*** TURNING ON OLED (voltage %u >= %u, speed %.2f allowed) ***\n",
+                           voltage_mv, OLED_VOLTAGE_ON_THRESHOLD_MV, current_speed);
                 oled_display_on();
                 oled_is_on = true;
                 // Force a display update to refresh the screen
@@ -1102,25 +1123,24 @@ int main()
         {
             uint32_t update_interval = (ble_advertising && !ble_connected) ? 250 : OLED_UPDATE_INTERVAL_MS;
 
-            if (showing_session && (current_time_ms - last_update_ms) >= update_interval)
+            if ((current_time_ms - last_update_ms) >= update_interval)
             {
-                update_oled_session(ble_connected, ble_advertising);
+                if (showing_session)
+                {
+                    update_oled_session(ble_connected, ble_advertising);
+                }
+                else
+                {
+                    update_oled_totals(ble_connected, ble_advertising);
+                }
                 last_update_ms = current_time_ms;
-            }
-            // Also update totals screen when advertising for flashing animation
-            else if (!showing_session && ble_advertising && !ble_connected && (current_time_ms - last_update_ms) >= 250)
-            {
-                update_oled_totals(ble_connected, ble_advertising);
-                last_update_ms = current_time_ms;
-            }
-            // Update session display on rotation when showing session
-            else if (showing_session && rotation_detected)
-            {
-                update_oled_session(ble_connected, ble_advertising);
-                last_update_ms = to_ms_since_boot(get_absolute_time());
             }
         }
 
+        sleep_run_from_xosc();
         sleep_ms(MAIN_LOOP_DELAY_MS);
+        // Re-enable ring oscillator (ROSC) and clocks
+        rosc_write(&rosc_hw->ctrl, ROSC_CTRL_ENABLE_BITS);
+        clocks_init();
     }
 }

@@ -28,6 +28,11 @@ set(PICO_BOARD pico_w CACHE STRING "Board type")
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
+# Pull in Pico Extras (needed for pico_sleep library)
+# Auto-fetch from GitHub if not already available
+set(PICO_EXTRAS_FETCH_FROM_GIT ON)
+include(pico_extras_import.cmake)
+
 project(walkolution-odometer C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
@@ -57,6 +62,9 @@ target_link_libraries(walkolution-odometer
     hardware_sync
     hardware_i2c
     hardware_adc
+    hardware_clocks
+    hardware_rosc
+    hardware_sleep
 )
 
 if (PICO_CYW43_SUPPORTED)

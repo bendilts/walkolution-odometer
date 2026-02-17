@@ -355,16 +355,18 @@ class MainActivity : ComponentActivity() {
             stravaStatus.value = "Uploading ${sessions.size} session(s) to Strava..."
 
             // Create combined session for upload
+            val totalActiveTime = sessions.sumOf { it.activeTimeSeconds }
+            val latestEndTime = sessions.mapNotNull {
+                if (it.endTimeUnix == 0L) null else it.endTimeUnix
+            }.maxOrNull() ?: (System.currentTimeMillis() / 1000) // Use current time if no end timestamps
+
             val combinedSession = SessionRecord(
                 sessionId = sessions.first().sessionId,
                 rotationCount = sessions.sumOf { it.rotationCount },
-                activeTimeSeconds = sessions.sumOf { it.activeTimeSeconds },
-                startTimeUnix = sessions.mapNotNull {
-                    if (it.startTimeUnix == 0L) null else it.startTimeUnix
-                }.minOrNull() ?: 0L,
-                endTimeUnix = sessions.mapNotNull {
-                    if (it.endTimeUnix == 0L) null else it.endTimeUnix
-                }.maxOrNull() ?: 0L
+                activeTimeSeconds = totalActiveTime,
+                // Use latest end time and calculate start time as end time minus total duration
+                startTimeUnix = latestEndTime - totalActiveTime,
+                endTimeUnix = latestEndTime
             )
 
             val result = stravaRepository.uploadSession(combinedSession)
@@ -789,6 +791,44 @@ fun OdometerScreen(
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.padding(bottom = 12.dp, top = 8.dp)
                 )
+
+                // Select All checkbox when there are at least 2 sessions
+                if (unreportedSessions.size >= 2) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp),
+                        onClick = {
+                            val allSessionIds = unreportedSessions.map { it.sessionId }.toSet()
+                            selectedSessions = if (selectedSessions.containsAll(allSessionIds)) {
+                                emptySet()  // Deselect all
+                            } else {
+                                allSessionIds  // Select all
+                            }
+                        }
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            val allSessionIds = unreportedSessions.map { it.sessionId }.toSet()
+                            androidx.compose.material3.Checkbox(
+                                checked = selectedSessions.containsAll(allSessionIds),
+                                onCheckedChange = null  // Handled by Card onClick
+                            )
+
+                            Text(
+                                text = "Select All",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.weight(1f).padding(start = 8.dp)
+                            )
+                        }
+                    }
+                }
 
                 unreportedSessions.sortedByDescending { it.sessionId }.forEach { session ->
                     Card(
