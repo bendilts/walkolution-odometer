@@ -60,6 +60,14 @@ static uint32_t last_write_index = 0;
 uint16_t odometer_read_voltage(void)
 {
     static uint16_t last_valid_voltage = 0; // Cache last known good reading
+    static uint32_t last_read_time_ms = 0;   // Time of last actual ADC read
+
+    // Return cached value if less than 1 second has passed
+    uint32_t current_time_ms = to_ms_since_boot(get_absolute_time());
+    if (last_valid_voltage > 0 && (current_time_ms - last_read_time_ms) < 1000)
+    {
+        return last_valid_voltage;
+    }
 
     // Pico W: GPIO29 is shared with WiFi chip SPI CLK
     // Must disable WiFi chip (GP25 high) to read VSYS
@@ -113,8 +121,9 @@ uint16_t odometer_read_voltage(void)
     }
     else
     {
-        // Valid reading - cache it for future use
+        // Valid reading - cache it and update timestamp
         last_valid_voltage = (uint16_t)vsys_mv;
+        last_read_time_ms = current_time_ms;
     }
 
     return (uint16_t)vsys_mv;

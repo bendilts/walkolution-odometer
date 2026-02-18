@@ -73,8 +73,6 @@
 #define VOLTAGE_CHECK_INTERVAL_MS 1000
 #endif
 
-#define OLED_VOLTAGE_OFF_THRESHOLD_MV 3000 // 3.0V - turn off OLED below this
-#define OLED_VOLTAGE_ON_THRESHOLD_MV 3500  // 3.5V - turn on OLED above this (hysteresis prevents flickering)
 #define BLE_VOLTAGE_THRESHOLD_MV 4200      // 4.2V minimum for Bluetooth
 #define BLE_UPDATE_INTERVAL_MS 1000        // Send data to phone every second
 
@@ -906,28 +904,20 @@ int main()
             // Speed module handles slow walking detection (turns off OLED only after 5 seconds of continuous slow walking at <1.5 mph)
             bool speed_allows_oled = speed_allows_oled_display(current_time_ms);
 
-            // Control OLED power with hysteresis to prevent flickering
-            // Turn off when: voltage < 3.0V OR (speed in slow walking range for 5+ seconds)
-            // Turn on when: voltage >= 3.5V AND (speed NOT in slow walking range for 5+ seconds)
-            if (oled_is_on && (voltage_mv < OLED_VOLTAGE_OFF_THRESHOLD_MV || !speed_allows_oled))
+            // Control OLED power based on walking speed
+            // Turn off when: speed in slow walking range for 5+ seconds
+            // Turn on when: speed NOT in slow walking range for 5+ seconds
+            if (oled_is_on && !speed_allows_oled)
             {
-                if (voltage_mv < OLED_VOLTAGE_OFF_THRESHOLD_MV)
-                {
-                    log_printf("*** TURNING OFF OLED (voltage %u < %u) ***\n",
-                               voltage_mv, OLED_VOLTAGE_OFF_THRESHOLD_MV);
-                }
-                else
-                {
-                    log_printf("*** TURNING OFF OLED (speed %.2f in slow walking range for 5+ seconds) ***\n",
-                               current_speed);
-                }
+                log_printf("*** TURNING OFF OLED (speed %.2f in slow walking range for 5+ seconds) ***\n",
+                           current_speed);
                 oled_display_off();
                 oled_is_on = false;
             }
-            else if (!oled_is_on && voltage_mv >= OLED_VOLTAGE_ON_THRESHOLD_MV && speed_allows_oled)
+            else if (!oled_is_on && speed_allows_oled)
             {
-                log_printf("*** TURNING ON OLED (voltage %u >= %u, speed %.2f allowed) ***\n",
-                           voltage_mv, OLED_VOLTAGE_ON_THRESHOLD_MV, current_speed);
+                log_printf("*** TURNING ON OLED (speed %.2f allows display) ***\n",
+                           current_speed);
                 oled_display_on();
                 oled_is_on = true;
                 // Force a display update to refresh the screen
@@ -951,8 +941,6 @@ int main()
                     // Voltage just went above threshold - start the timer
                     ble_voltage_is_above_threshold = true;
                     ble_voltage_above_threshold_start_ms = current_time_ms;
-                    log_printf("Voltage above BLE threshold (%u >= %u), starting %d second delay timer\n",
-                               voltage_mv, BLE_VOLTAGE_THRESHOLD_MV, BLE_ACTIVATION_DELAY_MS / 1000);
                 }
                 else if (!ble_advertising)
                 {
@@ -974,12 +962,6 @@ int main()
                     // Voltage dropped below threshold - reset the timer
                     ble_voltage_is_above_threshold = false;
                     ble_voltage_above_threshold_start_ms = 0;
-                    log_printf("Voltage dropped below BLE threshold (%u < %u), resetting delay timer\n",
-                               voltage_mv, BLE_VOLTAGE_THRESHOLD_MV);
-                }
-                else if (!ble_advertising)
-                {
-                    log_printf("Voltage too low for BLE: %u < %u\n", voltage_mv, BLE_VOLTAGE_THRESHOLD_MV);
                 }
             }
 
