@@ -48,6 +48,9 @@ android {
 }
 
 dependencies {
+    // Note: wearApp embedding was deprecated and no longer works in modern AGP
+    // Phone and watch APKs must be installed separately (see WEAR_OS_README.md)
+    // Removed: wearApp(project(":wear"))  // This doesn't actually embed anymore
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -77,4 +80,7 @@ dependencies {
 
     // Data persistence
     implementation(libs.datastore.preferences)
+
+    // Wearable Data Layer for phone-to-watch sync
+    implementation(libs.play.services.wearable)
 }

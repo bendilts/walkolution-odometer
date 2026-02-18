@@ -21,3 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "Walkolution Odometer"
 include(":app")
+include(":wear")

@@ -66,6 +66,9 @@ class BleService : Service() {
     // Session cache manager for syncing confirmations
     private lateinit var sessionCacheManager: SessionCacheManager
 
+    // Wear data sender for watch sync
+    private lateinit var wearDataSender: WearDataSender
+
     // State exposed to UI via StateFlow
     private val _scanning = MutableStateFlow(false)
     val scanning: StateFlow<Boolean> = _scanning.asStateFlow()
@@ -176,6 +179,7 @@ class BleService : Service() {
         notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         alarmManager = getSystemService(ALARM_SERVICE) as AlarmManager
         sessionCacheManager = SessionCacheManager(this)
+        wearDataSender = WearDataSender(this)
 
         createNotificationChannel()
 
@@ -203,14 +207,36 @@ class BleService : Service() {
         // Load cached sessions (filtering out uploaded and discarded)
         serviceScope.launch {
             val cached = sessionCacheManager.getCachedSessions()
-            if (cached.isNotEmpty()) {
-                val uploadedIds = sessionCacheManager.getUploadedSessions().map { it.sessionId }.toSet()
-                val discardedIds = sessionCacheManager.getDiscardedSessions().map { it.sessionId }.toSet()
-                val filteredCached = cached.filter {
-                    it.sessionId !in uploadedIds && it.sessionId !in discardedIds
-                }
-                _unreportedSessions.value = filteredCached
+            val uploadedIds = sessionCacheManager.getUploadedSessions().map { it.sessionId }.toSet()
+            val discardedIds = sessionCacheManager.getDiscardedSessions().map { it.sessionId }.toSet()
+            val filteredCached = cached.filter {
+                it.sessionId !in uploadedIds && it.sessionId !in discardedIds
             }
+
+            // Include current session if it has non-zero progress
+            val currentData = _odometerData.value
+            val sessionsWithCurrent = if (currentData.sessionId > 0 && currentData.sessionRotations > 0) {
+                val currentSessionInList = filteredCached.any { it.sessionId == currentData.sessionId }
+                if (!currentSessionInList) {
+                    // Add current session to the list
+                    val currentTime = System.currentTimeMillis() / 1000
+                    val startTime = currentTime - currentData.sessionTimeSeconds
+                    val currentSession = SessionRecord(
+                        sessionId = currentData.sessionId,
+                        rotationCount = currentData.sessionRotations,
+                        activeTimeSeconds = currentData.sessionTimeSeconds,
+                        startTimeUnix = startTime,
+                        endTimeUnix = currentTime
+                    )
+                    filteredCached + currentSession
+                } else {
+                    filteredCached
+                }
+            } else {
+                filteredCached
+            }
+
+            _unreportedSessions.value = sessionsWithCurrent
         }
 
         // Start scanning if we have permissions
@@ -788,37 +814,8 @@ class BleService : Service() {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.e(TAG, "Connection failed with status: $status")
 
-                // Save current session if it has non-zero progress
-                val currentData = _odometerData.value
-                if (currentData.sessionId > 0 && currentData.sessionRotations > 0) {
-                    Log.i(TAG, "Saving current session (ID ${currentData.sessionId}) to unreported sessions due to connection error")
-                    val currentTime = System.currentTimeMillis() / 1000
-                    val startTime = currentTime - currentData.sessionTimeSeconds
-
-                    val sessionToSave = SessionRecord(
-                        sessionId = currentData.sessionId,
-                        rotationCount = currentData.sessionRotations,
-                        activeTimeSeconds = currentData.sessionTimeSeconds,
-                        startTimeUnix = startTime,
-                        endTimeUnix = currentTime
-                    )
-
-                    // Add to unreported sessions list if not already present
-                    val currentSessions = _unreportedSessions.value
-                    if (currentSessions.none { it.sessionId == sessionToSave.sessionId }) {
-                        _unreportedSessions.value = currentSessions + sessionToSave
-                    }
-
-                    // Reset current session to zero with incremented ID
-                    _odometerData.value = currentData.copy(
-                        sessionMiles = 0f,
-                        sessionTime = "0:00",
-                        sessionAvgSpeed = 0f,
-                        sessionId = currentData.sessionId + 1,
-                        sessionRotations = 0,
-                        sessionTimeSeconds = 0
-                    )
-                }
+                // Current session is already part of unreported sessions list via updateUnreportedSessionsWithCurrent()
+                // No need to manually save it on disconnect anymore
 
                 _connectionStatus.value = "Connection error: $status"
                 _isConnected.value = false
@@ -855,6 +852,9 @@ class BleService : Service() {
                     pendingScanRunnable?.let { mainHandler.removeCallbacks(it) }
                     pendingScanRunnable = null
 
+                    // Send connection status to watch
+                    wearDataSender.sendOdometerData(_odometerData.value, true)
+
                     try {
                         if (hasBluetoothConnectPermission()) {
                             gatt.requestMtu(desiredMtu)
@@ -875,43 +875,17 @@ class BleService : Service() {
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.w(TAG, "BLE disconnected")
 
-                    // Save current session if it has non-zero progress
-                    val currentData = _odometerData.value
-                    if (currentData.sessionId > 0 && currentData.sessionRotations > 0) {
-                        Log.i(TAG, "Saving current session (ID ${currentData.sessionId}) to unreported sessions due to disconnect")
-                        val currentTime = System.currentTimeMillis() / 1000
-                        val startTime = currentTime - currentData.sessionTimeSeconds
-
-                        val sessionToSave = SessionRecord(
-                            sessionId = currentData.sessionId,
-                            rotationCount = currentData.sessionRotations,
-                            activeTimeSeconds = currentData.sessionTimeSeconds,
-                            startTimeUnix = startTime,
-                            endTimeUnix = currentTime
-                        )
-
-                        // Add to unreported sessions list if not already present
-                        val currentSessions = _unreportedSessions.value
-                        if (currentSessions.none { it.sessionId == sessionToSave.sessionId }) {
-                            _unreportedSessions.value = currentSessions + sessionToSave
-                        }
-
-                        // Reset current session to zero with incremented ID
-                        _odometerData.value = currentData.copy(
-                            sessionMiles = 0f,
-                            sessionTime = "0:00",
-                            sessionAvgSpeed = 0f,
-                            sessionId = currentData.sessionId + 1,
-                            sessionRotations = 0,
-                            sessionTimeSeconds = 0
-                        )
-                    }
+                    // Current session is already part of unreported sessions list via updateUnreportedSessionsWithCurrent()
+                    // No need to manually save it on disconnect anymore
 
                     _isConnected.value = false
                     isConnecting = false
                     connectionAttemptStartTime = 0
                     _connectionStatus.value = "Disconnected"
                     notificationsEnabled = false
+
+                    // Send disconnection status to watch
+                    wearDataSender.sendOdometerData(_odometerData.value, false)
 
                     // Stop log polling on disconnect
                     stopLogPolling()
@@ -1180,6 +1154,10 @@ class BleService : Service() {
             String(ssidBytes).trim('\u0000')
         } else ""
 
+        // Calculate unreported totals from all unreported sessions
+        val unreportedRotations = _unreportedSessions.value.sumOf { it.rotationCount }
+        val unreportedSeconds = _unreportedSessions.value.sumOf { it.activeTimeSeconds }
+
         val newData = OdometerData(
             sessionMiles = sessionRotations.toFloat() * MILES_PER_ROTATION,
             totalMiles = totalRotations.toFloat() * MILES_PER_ROTATION,
@@ -1191,13 +1169,18 @@ class BleService : Service() {
             sessionId = sessionId,
             sessionRotations = sessionRotations.toInt(),
             sessionTimeSeconds = sessionTimeSeconds.toInt(),
-            metric = metric
+            metric = metric,
+            unreportedMiles = unreportedRotations.toFloat() * MILES_PER_ROTATION,
+            unreportedTimeSeconds = unreportedSeconds
         )
 
         Log.d(TAG, "Parsed data: sessRot=$sessionRotations, runSpeed=$runningAvgSpeed ${if (metric) "km/h" else "mph"}, sessionId=$sessionId, metric=$metric, ssid=$ssid")
 
         val previousSessionId = _odometerData.value.sessionId
         _odometerData.value = newData
+
+        // Send data to watch
+        wearDataSender.sendOdometerData(newData, _isConnected.value)
 
         // Check for sessions uploaded while offline
         if (sessionId > 0 && sessionId != previousSessionId) {
@@ -1209,6 +1192,9 @@ class BleService : Service() {
                 }
             }
         }
+
+        // Update unreported sessions list to include current session
+        updateUnreportedSessionsWithCurrent()
 
         updateNotification()
     }
@@ -1479,8 +1465,32 @@ class BleService : Service() {
             val filteredSessions = sessions.filter {
                 it.sessionId !in uploadedIds && it.sessionId !in discardedIds
             }
-            _unreportedSessions.value = filteredSessions
-            Log.i(TAG, "Loaded ${sessions.size} sessions, showing ${filteredSessions.size}")
+
+            // Include current session if it has non-zero progress
+            val currentData = _odometerData.value
+            val sessionsWithCurrent = if (currentData.sessionId > 0 && currentData.sessionRotations > 0) {
+                val currentSessionInList = filteredSessions.any { it.sessionId == currentData.sessionId }
+                if (!currentSessionInList) {
+                    // Add current session to the list
+                    val currentTime = System.currentTimeMillis() / 1000
+                    val startTime = currentTime - currentData.sessionTimeSeconds
+                    val currentSession = SessionRecord(
+                        sessionId = currentData.sessionId,
+                        rotationCount = currentData.sessionRotations,
+                        activeTimeSeconds = currentData.sessionTimeSeconds,
+                        startTimeUnix = startTime,
+                        endTimeUnix = currentTime
+                    )
+                    filteredSessions + currentSession
+                } else {
+                    filteredSessions
+                }
+            } else {
+                filteredSessions
+            }
+
+            _unreportedSessions.value = sessionsWithCurrent
+            Log.i(TAG, "Loaded ${sessions.size} sessions, showing ${sessionsWithCurrent.size} (including current session if active)")
         }
     }
 
@@ -1706,6 +1716,49 @@ class BleService : Service() {
     // Update sessions list from external source (after filtering out uploaded)
     fun updateUnreportedSessions(sessions: List<SessionRecord>) {
         _unreportedSessions.value = sessions
+    }
+
+    // Helper to update unreported sessions list with current session included
+    private fun updateUnreportedSessionsWithCurrent() {
+        serviceScope.launch {
+            val currentSessions = _unreportedSessions.value
+            val currentData = _odometerData.value
+
+            // Check if current session has been uploaded or discarded
+            val uploadedIds = sessionCacheManager.getUploadedSessions().map { it.sessionId }.toSet()
+            val discardedIds = sessionCacheManager.getDiscardedSessions().map { it.sessionId }.toSet()
+
+            // Only include current session if it has non-zero progress and hasn't been uploaded/discarded
+            if (currentData.sessionId > 0 &&
+                currentData.sessionRotations > 0 &&
+                currentData.sessionId !in uploadedIds &&
+                currentData.sessionId !in discardedIds) {
+
+                // Remove any existing entry for this session ID and add updated one
+                val sessionsWithoutCurrent = currentSessions.filter { it.sessionId != currentData.sessionId }
+
+                val currentTime = System.currentTimeMillis() / 1000
+                val startTime = currentTime - currentData.sessionTimeSeconds
+                val currentSession = SessionRecord(
+                    sessionId = currentData.sessionId,
+                    rotationCount = currentData.sessionRotations,
+                    activeTimeSeconds = currentData.sessionTimeSeconds,
+                    startTimeUnix = startTime,
+                    endTimeUnix = currentTime
+                )
+
+                // Cache the current session so it persists across app restarts
+                // Merge with existing cached sessions to avoid losing them
+                val existingCached = sessionCacheManager.getCachedSessions()
+                val updatedCache = existingCached.filter { it.sessionId != currentSession.sessionId } + currentSession
+                sessionCacheManager.cacheSessions(updatedCache)
+
+                _unreportedSessions.value = sessionsWithoutCurrent + currentSession
+            } else {
+                // Remove current session from list if it was uploaded/discarded
+                _unreportedSessions.value = currentSessions.filter { it.sessionId != currentData.sessionId }
+            }
+        }
     }
 
     // Public API to read user settings (queues the request)

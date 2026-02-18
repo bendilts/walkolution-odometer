@@ -59,11 +59,15 @@ data class OdometerData(
     val sessionId: Int = 0,
     val sessionRotations: Int = 0,
     val sessionTimeSeconds: Int = 0,
-    val metric: Boolean = false  // true = km/km/h, false = mi/mph
+    val metric: Boolean = false,  // true = km/km/h, false = mi/mph
+    // Unreported session totals (sum of all unreported sessions)
+    val unreportedMiles: Float = 0f,
+    val unreportedTimeSeconds: Int = 0
 ) {
     val distanceUnit: String get() = if (metric) "km" else "mi"
     val speedUnit: String get() = if (metric) "km/h" else "mph"
     val distanceLabel: String get() = if (metric) "kilometers" else "miles"
+    val unreportedTime: String get() = formatTimeFromSeconds(unreportedTimeSeconds)
 }
 
 data class SessionRecord(
@@ -232,6 +236,38 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun handleIntent(intent: Intent) {
+        // Check if this intent came from the watch requesting "Report All"
+        if (intent.action == "com.mypeople.walkolutionodometer.REPORT_ALL") {
+            Log.i(TAG, "Received REPORT_ALL intent from watch")
+            lifecycleScope.launch {
+                // Wait a bit for service to be bound if needed
+                var attempts = 0
+                while (!serviceBound && attempts < 20) {
+                    kotlinx.coroutines.delay(100)
+                    attempts++
+                }
+
+                // Get all unreported sessions and upload them
+                val sessions = unreportedSessions.value
+                if (sessions.isNotEmpty() && stravaAuthenticated.value) {
+                    Log.i(TAG, "Auto-uploading ${sessions.size} sessions from watch request")
+                    uploadSessionsToStrava(sessions)
+                } else if (!stravaAuthenticated.value) {
+                    Log.w(TAG, "Cannot auto-upload: Strava not authenticated")
+                } else {
+                    Log.i(TAG, "No unreported sessions to upload")
+                }
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -247,6 +283,9 @@ class MainActivity : ComponentActivity() {
             stravaAuthenticated.value = stravaRepository.isAuthenticated()
             stravaAthleteName.value = stravaRepository.getAthleteName()
         }
+
+        // Handle intent from watch (report all sessions)
+        handleIntent(intent)
 
         setContent {
             WalkolutionOdometerTheme {
@@ -717,7 +756,7 @@ fun OdometerScreen(
             ) {
                 Text(text = "Distance:", fontSize = 18.sp)
                 Text(
-                    text = String.format("%.2f %s", odometerData.sessionMiles, odometerData.distanceUnit),
+                    text = String.format("%.2f %s", odometerData.unreportedMiles, odometerData.distanceUnit),
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Medium
                 )
@@ -730,7 +769,7 @@ fun OdometerScreen(
             ) {
                 Text(text = "Time:", fontSize = 18.sp)
                 Text(
-                    text = odometerData.sessionTime,
+                    text = odometerData.unreportedTime,
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Medium
                 )

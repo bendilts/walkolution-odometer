@@ -78,9 +78,6 @@ uint32_t odometer_get_current_unix_time(void);
 // Get current session ID
 uint32_t odometer_get_current_session_id(void);
 
-// Reset the speed calculation window (called when starting a new session)
-void odometer_reset_speed_window(void);
-
 // Set lifetime totals (for transferring progress to a new device)
 // hours: total hours of active time
 // distance_miles: total distance in miles

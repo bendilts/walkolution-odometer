@@ -1,0 +1,36 @@
+# Testing Instructions for Claude Code
+
+## ⚠️ MANDATORY: Run Tests After Code Changes
+
+If you modify any firmware code (`.c` or `.h` files in the project root), you **MUST** run the test suite before completing your task.
+
+### Quick Command (Recommended)
+```bash
+./test/run_tests.sh
+```
+
+### Alternative (Manual)
+```bash
+cmake --build test/build && test/build/test_speed
+```
+
+### Expected Output (All Tests Pass)
+```
+27 Tests 0 Failures 0 Ignored
+OK
+```
+
+### What to Do If Tests Fail
+1. Read the failure message carefully
+2. Fix the bug in your code, OR
+3. Update the test if behavior change was intentional
+4. Never commit failing tests
+
+## Full Documentation
+See [test/TESTING_POLICY.md](test/TESTING_POLICY.md) for complete testing requirements and workflows.
+
+## Current Test Status
+- ✅ test_speed: 27 tests (speed.c module)
+
+## Test Location
+All test files are in `/test` directory.

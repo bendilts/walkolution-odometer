@@ -6,6 +6,7 @@
 #include "flash.h"
 #include "logging.h"
 #include "irq.h"
+#include "speed.h"
 #include "pico/stdlib.h"
 #include "hardware/flash.h"
 #include "hardware/adc.h"
@@ -494,7 +495,7 @@ bool odometer_mark_session_reported(uint32_t session_id)
         session.current_session_id = session_id + 1;
         counts.session_rotations = 0;
         counts.session_active_seconds = 0;
-        odometer_reset_speed_window();
+        speed_reset();
 
         if (session.time_acquired)
         {

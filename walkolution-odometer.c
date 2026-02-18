@@ -19,6 +19,7 @@
 #include "icons.h"
 #include "user_settings.h"
 #include "logging.h"
+#include "speed.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -74,10 +75,8 @@
 
 #define OLED_VOLTAGE_OFF_THRESHOLD_MV 3000 // 3.0V - turn off OLED below this
 #define OLED_VOLTAGE_ON_THRESHOLD_MV 3500  // 3.5V - turn on OLED above this (hysteresis prevents flickering)
-#define OLED_SPEED_OFF_THRESHOLD 1.5f      // Turn off OLED when speed is >0 but <1.5 mph/kph
 #define BLE_VOLTAGE_THRESHOLD_MV 4200      // 4.2V minimum for Bluetooth
 #define BLE_UPDATE_INTERVAL_MS 1000        // Send data to phone every second
-#define SPEED_WINDOW_SECONDS 5             // 5-second running average for speed
 
 // Perform initialisation
 int pico_led_init(void)
@@ -175,9 +174,6 @@ void get_clock_time_str(char *buffer, size_t size)
 
     snprintf(buffer, size, "%lu:%02lu %s", hours, minutes, am_pm);
 }
-
-// Forward declarations
-static float calculate_running_avg_speed(void);
 
 // Draw common status bar at bottom of display
 // Shows: Clock (left) | Voltage (center) | Connection icon (right)
@@ -384,17 +380,6 @@ static bool ble_voltage_is_above_threshold = false;       // Current voltage sta
 
 // Connection status is now integrated into update_oled_session() and update_oled_totals()
 
-// Speed calculation
-typedef struct
-{
-    uint32_t rotations[SPEED_WINDOW_SECONDS];
-    uint32_t timestamps_ms[SPEED_WINDOW_SECONDS];
-    int index;
-    bool filled;
-} speed_window_t;
-
-static speed_window_t speed_window = {0};
-
 // Define custom UUIDs for our service
 // Service UUID: 12345678-1234-5678-1234-56789abcdef0
 static const uint8_t odometer_service_uuid[] = {0xf0, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12};
@@ -463,10 +448,6 @@ static const uint8_t scan_rsp_data[] = {
 };
 static const uint8_t scan_rsp_data_len = sizeof(scan_rsp_data);
 
-// Forward declarations
-static float calculate_running_avg_speed(void);
-static float calculate_session_avg_speed(void);
-
 // Packet handler for HCI and GAP events
 static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
 {
@@ -519,8 +500,8 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             data.total_rotations = odometer_get_count();
             data.session_time_seconds = odometer_get_session_active_time_seconds();
             data.total_time_seconds = odometer_get_active_time_seconds();
-            data.running_avg_speed = calculate_running_avg_speed();
-            data.session_avg_speed = calculate_session_avg_speed();
+            data.running_avg_speed = speed_get_running_avg(user_settings_is_metric());
+            data.session_avg_speed = speed_get_session_avg(odometer_get_session_count(), odometer_get_session_active_time_seconds(), user_settings_is_metric());
             data.voltage_mv = odometer_read_voltage();
             data.session_id = odometer_get_current_session_id();
 
@@ -557,79 +538,6 @@ void start_ble_advertising(void)
     log_printf("BLE advertising started\n");
 }
 
-// Reset speed window (called when starting a new session)
-void odometer_reset_speed_window(void)
-{
-    memset(&speed_window, 0, sizeof(speed_window));
-    log_printf("[SPEED] Speed window reset (starting new session)\n");
-}
-
-// Update speed window with new rotation
-void update_speed_window(uint32_t current_time_ms)
-{
-    // Use session rotations for speed calculation
-    uint32_t current_rotations = odometer_get_session_count();
-
-    speed_window.rotations[speed_window.index] = current_rotations;
-    speed_window.timestamps_ms[speed_window.index] = current_time_ms;
-
-    speed_window.index = (speed_window.index + 1) % SPEED_WINDOW_SECONDS;
-    if (speed_window.index == 0)
-    {
-        speed_window.filled = true;
-    }
-}
-
-// Calculate 5-second running average speed in mph or km/h (based on metric setting)
-float calculate_running_avg_speed(void)
-{
-    if (!speed_window.filled && speed_window.index < 2)
-    {
-        return 0.0f; // Need at least 2 data points
-    }
-
-    int oldest_index = speed_window.filled ? speed_window.index : 0;
-    int newest_index = speed_window.filled ? ((speed_window.index - 1 + SPEED_WINDOW_SECONDS) % SPEED_WINDOW_SECONDS) : (speed_window.index - 1);
-
-    uint32_t rotation_diff = speed_window.rotations[newest_index] - speed_window.rotations[oldest_index];
-    uint32_t time_diff_ms = speed_window.timestamps_ms[newest_index] - speed_window.timestamps_ms[oldest_index];
-
-    if (time_diff_ms == 0)
-    {
-        return 0.0f;
-    }
-
-    // Convert to rotations per hour
-    float rotations_per_ms = (float)rotation_diff / (float)time_diff_ms;
-    float rotations_per_hour = rotations_per_ms * 3600000.0f;
-
-    // Convert to mph or km/h based on metric setting
-    bool metric = user_settings_is_metric();
-    return rotations_per_hour * (metric ? KM_PER_ROTATION : MILES_PER_ROTATION);
-}
-
-// Calculate session average speed in mph or km/h (based on metric setting)
-// Note: This uses session rotations/time which may include merged sessions.
-// This is intentional - we want the average speed for the entire session (including merged data).
-float calculate_session_avg_speed(void)
-{
-    uint32_t session_time = odometer_get_session_active_time_seconds();
-    if (session_time == 0)
-    {
-        return 0.0f;
-    }
-
-    uint32_t session_rotations = odometer_get_session_count();
-
-    // Convert to rotations per hour
-    float rotations_per_second = (float)session_rotations / (float)session_time;
-    float rotations_per_hour = rotations_per_second * 3600.0f;
-
-    // Convert to mph or km/h based on metric setting
-    bool metric = user_settings_is_metric();
-    return rotations_per_hour * (metric ? KM_PER_ROTATION : MILES_PER_ROTATION);
-}
-
 // GATT database is now generated from walkolution-odometer.gatt
 // The profile_data array and characteristic handles are defined in the generated header
 
@@ -646,8 +554,8 @@ static uint16_t att_read_callback(hci_con_handle_t con_handle, uint16_t att_hand
         data.total_rotations = odometer_get_count();
         data.session_time_seconds = odometer_get_session_active_time_seconds();
         data.total_time_seconds = odometer_get_active_time_seconds();
-        data.running_avg_speed = calculate_running_avg_speed();
-        data.session_avg_speed = calculate_session_avg_speed();
+        data.running_avg_speed = speed_get_running_avg(user_settings_is_metric());
+        data.session_avg_speed = speed_get_session_avg(odometer_get_session_count(), odometer_get_session_active_time_seconds(), user_settings_is_metric());
         data.voltage_mv = odometer_read_voltage();
         data.session_id = odometer_get_current_session_id();
 
@@ -993,19 +901,18 @@ int main()
         if ((current_time_ms - last_voltage_check_ms) >= VOLTAGE_CHECK_INTERVAL_MS)
         {
             uint16_t voltage_mv = odometer_read_voltage();
-            float current_speed = calculate_running_avg_speed();
+            float current_speed = speed_get_running_avg(user_settings_is_metric());
 
             log_printf("[%lu] %u mV, Speed: %.2f, BLE: adv=%d con=%d, OLED=%d\n",
                        current_time_ms, voltage_mv, current_speed, ble_advertising, ble_connected, oled_is_on);
 
-            // Determine if speed allows OLED to be on
-            // OLED is allowed when: speed == 0 (stopped) OR speed >= 1.5 mph/kph
-            // OLED is NOT allowed when: 0 < speed < 1.5 mph/kph
-            bool speed_allows_oled = (current_speed == 0.0f) || (current_speed >= OLED_SPEED_OFF_THRESHOLD);
+            // Check if speed allows OLED to be on
+            // Speed module handles slow walking detection (turns off OLED only after 5 seconds of continuous slow walking at <1.5 mph)
+            bool speed_allows_oled = speed_allows_oled_display(current_time_ms);
 
             // Control OLED power with hysteresis to prevent flickering
-            // Turn off when: voltage < 3.0V OR (0 < speed < 1.5)
-            // Turn on when: voltage >= 3.5V AND (speed == 0 OR speed >= 1.5)
+            // Turn off when: voltage < 3.0V OR (speed in slow walking range for 5+ seconds)
+            // Turn on when: voltage >= 3.5V AND (speed NOT in slow walking range for 5+ seconds)
             if (oled_is_on && (voltage_mv < OLED_VOLTAGE_OFF_THRESHOLD_MV || !speed_allows_oled))
             {
                 if (voltage_mv < OLED_VOLTAGE_OFF_THRESHOLD_MV)
@@ -1015,8 +922,8 @@ int main()
                 }
                 else
                 {
-                    log_printf("*** TURNING OFF OLED (speed %.2f in restricted range 0 < speed < %.2f) ***\n",
-                               current_speed, OLED_SPEED_OFF_THRESHOLD);
+                    log_printf("*** TURNING OFF OLED (speed %.2f in slow walking range for 5+ seconds) ***\n",
+                               current_speed);
                 }
                 oled_display_off();
                 oled_is_on = false;
@@ -1089,7 +996,7 @@ int main()
         // Update speed window every second
         if ((current_time_ms - last_speed_window_update_ms) >= 1000)
         {
-            update_speed_window(current_time_ms);
+            speed_update(odometer_get_session_count(), current_time_ms);
             last_speed_window_update_ms = current_time_ms;
         }
 

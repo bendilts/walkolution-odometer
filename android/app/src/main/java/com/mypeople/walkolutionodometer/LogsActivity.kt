@@ -143,8 +143,8 @@ class LogsActivity : ComponentActivity() {
 
     // Helper function to check if a log line is a battery status message
     private fun isBatteryStatusMessage(line: String): Boolean {
-        // Matches pattern like "[12345] 3456 mV, BLE: ..."
-        val pattern = """^\[\d+\]\s+\d+\s+mV,\s+BLE:.*""".toRegex()
+        // Matches pattern like "[12345] 3456 mV, Speed: 0.00, BLE: adv=1 con=0, OLED=1"
+        val pattern = """^\[\d+\]\s+\d+\s+mV,\s+Speed:.*""".toRegex()
         return pattern.matches(line)
     }
 

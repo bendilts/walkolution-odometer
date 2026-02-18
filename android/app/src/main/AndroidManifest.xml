@@ -108,6 +108,19 @@
                 <action android:name="com.mypeople.walkolutionodometer.PERIODIC_CONNECTION_ATTEMPT" />
             </intent-filter>
         </receiver>
+
+        <!-- Wear Message Listener for watch-to-phone commands -->
+        <service
+            android:name=".WearMessageListener"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data
+                    android:scheme="wear"
+                    android:host="*"
+                    android:pathPrefix="/report_all" />
+            </intent-filter>
+        </service>
     </application>
 
 </manifest>
