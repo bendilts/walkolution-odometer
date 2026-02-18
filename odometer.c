@@ -14,10 +14,11 @@
 #include <stdio.h>
 
 #define SLEEP_TIMEOUT_MS 10000
-#define ACTIVE_TIMEOUT_MS 3000       // Stop counting active time after 3 seconds of no rotations
-#define FLASH_SAVE_INTERVAL_MS 60000 // Don't save more than once per minute
-#define ROTATION_SAVE_INTERVAL 2500  // Save every 2500 rotations (~0.5 miles)
-#define TIME_SYNC_TIMEOUT_MS 60000   // Wait up to 60 seconds for time sync before allowing saves
+#define ACTIVE_TIMEOUT_MS 3000         // Stop counting active time after 3 seconds of no rotations
+#define FLASH_SAVE_INTERVAL_MS 60000   // Don't save more than once per minute
+#define ROTATION_SAVE_INTERVAL 2500    // Save every 2500 rotations (~0.5 miles)
+#define TIME_SYNC_TIMEOUT_MS 60000     // Wait up to 60 seconds for time sync before allowing saves
+#define VOLTAGE_SAVE_THRESHOLD_MV 3300 // 3.3V - save when voltage drops below this
 
 // Organized state structures
 typedef struct
@@ -42,8 +43,6 @@ typedef struct
 
 typedef struct
 {
-    bool voltage_save_enabled;
-    uint16_t voltage_threshold_mv;
     uint32_t last_saved_count;
     uint32_t last_save_time_ms;
 } save_state_t;
@@ -334,6 +333,20 @@ bool odometer_process(void)
         }
     }
 
+    // Check voltage - save immediately if voltage drops below threshold (power loss imminent)
+    // This runs regardless of whether there are rotations, so we can save even when idle
+    uint16_t vsys_mv = odometer_read_voltage();
+    if (vsys_mv <= VOLTAGE_SAVE_THRESHOLD_MV)
+    {
+        // Voltage is low - save immediately before potential power loss
+        // (only if count has changed and at least 1 minute since last save)
+        if (counts.lifetime_rotations != save_state.last_saved_count &&
+            (current_time_ms - save_state.last_save_time_ms) >= FLASH_SAVE_INTERVAL_MS)
+        {
+            odometer_save_count();
+        }
+    }
+
     return rotation_detected;
 }
 
@@ -377,17 +390,6 @@ uint32_t odometer_get_session_active_time_seconds(void)
     return total;
 }
 
-void odometer_enable_voltage_save(uint16_t threshold_mv)
-{
-    save_state.voltage_save_enabled = true;
-    save_state.voltage_threshold_mv = threshold_mv;
-}
-
-void odometer_disable_voltage_save(void)
-{
-    save_state.voltage_save_enabled = false;
-}
-
 void odometer_add_rotation(void)
 {
     uint32_t current_time_ms = to_ms_since_boot(get_absolute_time());
@@ -409,23 +411,6 @@ void odometer_add_rotation(void)
     if ((counts.lifetime_rotations - save_state.last_saved_count) >= ROTATION_SAVE_INTERVAL)
     {
         odometer_save_count();
-    }
-
-    // Check voltage if voltage-based saving is enabled
-    // Save immediately if voltage drops below threshold (power loss imminent)
-    if (save_state.voltage_save_enabled)
-    {
-        uint16_t vsys_mv = odometer_read_voltage();
-        if (vsys_mv <= save_state.voltage_threshold_mv)
-        {
-            // Voltage is low - save immediately before potential power loss
-            // (only if count has changed and at least 1 minute since last save)
-            if (counts.lifetime_rotations != save_state.last_saved_count &&
-                (current_time_ms - save_state.last_save_time_ms) >= FLASH_SAVE_INTERVAL_MS)
-            {
-                odometer_save_count();
-            }
-        }
     }
 }
 
@@ -582,18 +567,3 @@ void odometer_set_lifetime_totals(float hours, float distance_miles)
     odometer_save_count();
     log_printf("  - Lifetime totals saved successfully\n");
 }
-
-// WiFi/NTP functions - to be implemented
-// Note: This is a stub. Full implementation requires:
-// 1. Initialize WiFi with cyw43_arch_init()
-// 2. Connect to WiFi using cyw43_arch_wifi_connect_blocking()
-// 3. Initialize SNTP with sntp_init()
-// 4. Wait for SNTP sync
-// 5. Get time with sntp_get_time()
-// 6. Disconnect WiFi and disable
-//
-// For now, this functionality is not implemented and timestamps will be 0.
-// The system will work fine without timestamps - sessions will just be merged
-// more aggressively until NTP is implemented.
-//
-// Example implementation can be found in pico-examples/pico_w/wifi/ntp_client/

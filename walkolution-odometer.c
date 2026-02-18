@@ -853,10 +853,6 @@ int main()
 
     sleep_ms(2000); // Show startup screen for 2 seconds
 
-    // Enable voltage-based flash save: only save when voltage drops below 3.3V
-    // This extends flash lifetime when powered by supercapacitor/generator
-    odometer_enable_voltage_save(3300); // 3300 mV = 3.3V
-
     // Display state tracking
     bool showing_session = true; // True = session screen, False = totals screen
     uint32_t last_display_switch_ms = to_ms_since_boot(get_absolute_time());

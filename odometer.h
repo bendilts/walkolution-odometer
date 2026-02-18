@@ -32,13 +32,6 @@ uint32_t odometer_get_session_active_time_seconds(void);
 // Save current count and active time to flash
 void odometer_save_count(void);
 
-// Enable voltage-based flash save (only save when voltage drops below threshold)
-// threshold_mv: voltage in millivolts (e.g., 3300 for 3.3V)
-void odometer_enable_voltage_save(uint16_t threshold_mv);
-
-// Disable voltage-based flash save (always save before sleep)
-void odometer_disable_voltage_save(void);
-
 // Read current VSYS voltage in millivolts
 uint16_t odometer_read_voltage(void);
 
