@@ -31,9 +31,15 @@ class SettingsActivity : ComponentActivity() {
     private var bleService: BleService? = null
     private var serviceBound = false
 
+    // Managers
+    private lateinit var userPreferencesManager: UserPreferencesManager
+
     // State from service
     private var userSettings = mutableStateOf<UserSettings?>(null)
     private var isConnected = mutableStateOf(false)
+
+    // Local preferences state
+    private var dailyGoalMiles = mutableStateOf(6.0f)
 
     companion object {
         private const val TAG = "SettingsActivity"
@@ -72,16 +78,40 @@ class SettingsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Initialize preferences manager
+        userPreferencesManager = UserPreferencesManager(this)
+
+        // Load local preferences
+        lifecycleScope.launch {
+            userPreferencesManager.dailyGoalMiles.collect { goal ->
+                dailyGoalMiles.value = goal
+            }
+        }
+
         setContent {
             WalkolutionOdometerTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     SettingsScreen(
                         userSettings = userSettings.value,
                         isConnected = isConnected.value,
-                        onSaveSettings = { metric ->
-                            bleService?.writeUserSettings(metric)
-                            Toast.makeText(this@SettingsActivity, "Settings saved!", Toast.LENGTH_SHORT).show()
-                            finish()
+                        dailyGoalMiles = dailyGoalMiles.value,
+                        onSaveSettings = { metric, dailyGoal ->
+                            lifecycleScope.launch {
+                                // Save local preferences (always works, no Pico needed)
+                                userPreferencesManager.setDailyGoalMiles(dailyGoal)
+
+                                // Save Pico settings only if connected
+                                if (isConnected.value) {
+                                    bleService?.writeUserSettings(metric)
+                                }
+
+                                Toast.makeText(
+                                    this@SettingsActivity,
+                                    "Settings saved!",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                finish()
+                            }
                         },
                         onBack = { finish() },
                         modifier = Modifier.padding(innerPadding)
@@ -109,26 +139,42 @@ class SettingsActivity : ComponentActivity() {
 fun SettingsScreen(
     userSettings: UserSettings?,
     isConnected: Boolean,
-    onSaveSettings: (metric: Boolean) -> Unit,
+    dailyGoalMiles: Float,
+    onSaveSettings: (metric: Boolean, dailyGoalMiles: Float) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     var metric by remember { mutableStateOf(userSettings?.metric ?: false) }
+    var dailyGoal by remember { mutableStateOf(dailyGoalMiles.toString()) }
     var hasChanges by remember { mutableStateOf(false) }
+    var hasPicoChanges by remember { mutableStateOf(false) }
+    var hasLocalChanges by remember { mutableStateOf(false) }
 
     // Update local state when userSettings changes
     LaunchedEffect(userSettings) {
         userSettings?.let {
             metric = it.metric
-            hasChanges = false
         }
     }
 
+    // Update daily goal when prop changes
+    LaunchedEffect(dailyGoalMiles) {
+        dailyGoal = dailyGoalMiles.toString()
+    }
+
     // Track changes
-    LaunchedEffect(metric, userSettings) {
-        hasChanges = userSettings?.let {
+    LaunchedEffect(metric, userSettings, dailyGoal, dailyGoalMiles) {
+        // Pico changes (metric)
+        hasPicoChanges = userSettings?.let {
             metric != it.metric
         } ?: false
+
+        // Local changes (daily goal)
+        val dailyGoalFloat = dailyGoal.toFloatOrNull() ?: dailyGoalMiles
+        hasLocalChanges = dailyGoalFloat != dailyGoalMiles
+
+        // Any changes
+        hasChanges = hasPicoChanges || hasLocalChanges
     }
 
     Column(
@@ -171,7 +217,10 @@ fun SettingsScreen(
             )
         ) {
             Text(
-                text = if (isConnected) "Connected to Pico" else "Disconnected - Connect to view/change settings",
+                text = if (isConnected)
+                    "Connected to Pico"
+                else
+                    "Disconnected - Some settings require Pico connection",
                 modifier = Modifier.padding(16.dp),
                 color = if (isConnected)
                     MaterialTheme.colorScheme.onPrimaryContainer
@@ -180,7 +229,7 @@ fun SettingsScreen(
             )
         }
 
-        // Settings form
+        // Pico Device Settings (requires connection)
         Card(
             modifier = Modifier
                 .fillMaxWidth()
@@ -188,10 +237,16 @@ fun SettingsScreen(
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
-                    text = "Units",
+                    text = "Device Settings",
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(bottom = 8.dp)
+                    modifier = Modifier.padding(bottom = 4.dp)
+                )
+                Text(
+                    text = "Requires Pico connection",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 12.dp)
                 )
 
                 Row(
@@ -219,25 +274,90 @@ fun SettingsScreen(
             }
         }
 
+        // Local App Settings (always available)
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 16.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    text = "App Settings",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(bottom = 4.dp)
+                )
+                Text(
+                    text = "Local preferences (no connection required)",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 12.dp)
+                )
+
+                Text(
+                    text = "Daily Goal (miles)",
+                    fontSize = 14.sp,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+
+                OutlinedTextField(
+                    value = dailyGoal,
+                    onValueChange = { dailyGoal = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp),
+                    label = { Text("Daily Goal") },
+                    suffix = { Text("miles") },
+                    singleLine = true,
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal
+                    )
+                )
+
+                Text(
+                    text = "This goal is used for the watch complication progress bar",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
         // Save button
         Button(
-            onClick = { onSaveSettings(metric) },
-            enabled = isConnected && hasChanges,
+            onClick = {
+                val dailyGoalFloat = dailyGoal.toFloatOrNull() ?: dailyGoalMiles
+                onSaveSettings(metric, dailyGoalFloat)
+            },
+            enabled = hasChanges && (!hasPicoChanges || isConnected),
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp)
         ) {
             Text(
-                text = if (hasChanges) "Save Settings" else "No Changes",
+                text = when {
+                    !hasChanges -> "No Changes"
+                    hasPicoChanges && !isConnected -> "Connect to Save Device Settings"
+                    else -> "Save Settings"
+                },
                 fontSize = 16.sp
             )
         }
 
-        if (!isConnected) {
+        if (hasPicoChanges && !isConnected) {
             Text(
-                text = "Connect to the Pico to change settings",
+                text = "Connect to the Pico to save device settings (local settings can be saved without connection)",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.error,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
+        } else if (hasLocalChanges && !isConnected) {
+            Text(
+                text = "Local settings can be saved without Pico connection",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.primary,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 8.dp),

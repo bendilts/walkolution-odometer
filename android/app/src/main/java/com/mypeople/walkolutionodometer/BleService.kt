@@ -66,8 +66,14 @@ class BleService : Service() {
     // Session cache manager for syncing confirmations
     private lateinit var sessionCacheManager: SessionCacheManager
 
+    // User preferences manager for local settings
+    private lateinit var userPreferencesManager: UserPreferencesManager
+
     // Wear data sender for watch sync
     private lateinit var wearDataSender: WearDataSender
+
+    // Daily goal miles (loaded from preferences)
+    private var dailyGoalMiles = 6.0f
 
     // State exposed to UI via StateFlow
     private val _scanning = MutableStateFlow(false)
@@ -179,7 +185,17 @@ class BleService : Service() {
         notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         alarmManager = getSystemService(ALARM_SERVICE) as AlarmManager
         sessionCacheManager = SessionCacheManager(this)
+        userPreferencesManager = UserPreferencesManager(this)
         wearDataSender = WearDataSender(this)
+
+        // Load daily goal preference
+        serviceScope.launch {
+            userPreferencesManager.dailyGoalMiles.collect { goal ->
+                dailyGoalMiles = goal
+                // Send updated goal to watch
+                wearDataSender.sendOdometerData(_odometerData.value, _isConnected.value, goal)
+            }
+        }
 
         createNotificationChannel()
 
@@ -237,6 +253,9 @@ class BleService : Service() {
             }
 
             _unreportedSessions.value = sessionsWithCurrent
+
+            // Update odometer data with unreported totals from cached sessions
+            updateOdometerDataFromCache(sessionsWithCurrent)
         }
 
         // Start scanning if we have permissions
@@ -853,7 +872,7 @@ class BleService : Service() {
                     pendingScanRunnable = null
 
                     // Send connection status to watch
-                    wearDataSender.sendOdometerData(_odometerData.value, true)
+                    wearDataSender.sendOdometerData(_odometerData.value, true, dailyGoalMiles)
 
                     try {
                         if (hasBluetoothConnectPermission()) {
@@ -885,7 +904,7 @@ class BleService : Service() {
                     notificationsEnabled = false
 
                     // Send disconnection status to watch
-                    wearDataSender.sendOdometerData(_odometerData.value, false)
+                    wearDataSender.sendOdometerData(_odometerData.value, false, dailyGoalMiles)
 
                     // Stop log polling on disconnect
                     stopLogPolling()
@@ -1180,7 +1199,7 @@ class BleService : Service() {
         _odometerData.value = newData
 
         // Send data to watch
-        wearDataSender.sendOdometerData(newData, _isConnected.value)
+        wearDataSender.sendOdometerData(newData, _isConnected.value, dailyGoalMiles)
 
         // Check for sessions uploaded while offline
         if (sessionId > 0 && sessionId != previousSessionId) {
@@ -1209,6 +1228,27 @@ class BleService : Service() {
         } else {
             String.format("%d:%02d", minutes, secs)
         }
+    }
+
+    /**
+     * Updates odometer data with unreported totals calculated from cached sessions.
+     * This is called on startup to show unreported miles before connecting to Pico.
+     */
+    private fun updateOdometerDataFromCache(sessions: List<SessionRecord>) {
+        val unreportedRotations = sessions.sumOf { it.rotationCount }
+        val unreportedSeconds = sessions.sumOf { it.activeTimeSeconds }
+
+        val updatedData = _odometerData.value.copy(
+            unreportedMiles = unreportedRotations.toFloat() * MILES_PER_ROTATION,
+            unreportedTimeSeconds = unreportedSeconds
+        )
+
+        _odometerData.value = updatedData
+
+        // Send updated data to watch
+        wearDataSender.sendOdometerData(updatedData, _isConnected.value, dailyGoalMiles)
+
+        Log.d(TAG, "Updated odometer data from cache: unreported=${updatedData.unreportedMiles} mi, sessions=${sessions.size}")
     }
 
     fun startBluetoothScan() {

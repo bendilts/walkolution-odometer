@@ -1,0 +1,76 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- Simplified walking person icon for complications -->
+    <group
+        android:translateX="12"
+        android:translateY="12">
+
+        <!-- Head -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M0,-6 a2,2 0 1,1 0.01,0" />
+
+        <!-- Body -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M-0.7,-3.5 L-0.7,2.5 L0.7,2.5 L0.7,-3.5 Z" />
+
+        <!-- Left arm (forward swing) -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M-0.7,-3 L-2.5,0.5 L-1.5,1.2 L0.3,-2 Z" />
+
+        <!-- Right arm (back swing) -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M0.7,-2 L2,-4 L2.5,-3.5 L1.3,-1.5 Z" />
+
+        <!-- Left leg (forward step) -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M-0.7,2.5 L-2,6.5 L-1,6.8 L0.3,2.8 Z" />
+
+        <!-- Right leg (back step) -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M0.7,2.5 L1.3,5.8 L2.2,5.5 L1.5,2.3 Z" />
+
+        <!-- Odometer arc -->
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="1"
+            android:strokeLineCap="round"
+            android:pathData="M-6.5,-3 A8,8 0 0,1 6.5,-3"
+            android:strokeAlpha="0.8" />
+
+        <!-- Tick marks -->
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="0.8"
+            android:strokeLineCap="round"
+            android:pathData="M-6.5,-3 L-6,-1.5"
+            android:strokeAlpha="0.9" />
+
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="0.8"
+            android:strokeLineCap="round"
+            android:pathData="M0,-5.3 L0,-3.8"
+            android:strokeAlpha="0.9" />
+
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="0.8"
+            android:strokeLineCap="round"
+            android:pathData="M6.5,-3 L6,-1.5"
+            android:strokeAlpha="0.9" />
+    </group>
+</vector>

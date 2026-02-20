@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">Walkolution</string>
     <string name="tile_label">Walkolution</string>
+    <string name="complication_label">Walkolution Unreported</string>
 </resources>

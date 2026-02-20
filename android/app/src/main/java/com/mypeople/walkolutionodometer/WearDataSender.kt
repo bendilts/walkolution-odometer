@@ -19,7 +19,7 @@ class WearDataSender(private val context: Context) {
         private const val ODOMETER_PATH = "/odometer"
     }
 
-    fun sendOdometerData(data: OdometerData, isConnected: Boolean) {
+    fun sendOdometerData(data: OdometerData, isConnected: Boolean, dailyGoalMiles: Float = 6.0f) {
         scope.launch {
             try {
                 val putDataReq = PutDataMapRequest.create(ODOMETER_PATH).apply {
@@ -31,6 +31,7 @@ class WearDataSender(private val context: Context) {
                     dataMap.putString("lifetimeTime", data.totalTime)
                     dataMap.putBoolean("metric", data.metric)
                     dataMap.putBoolean("isConnected", isConnected)
+                    dataMap.putFloat("dailyGoalMiles", dailyGoalMiles)
                     dataMap.putLong("timestamp", System.currentTimeMillis())
                 }.asPutDataRequest()
                     .setUrgent()  // Send immediately

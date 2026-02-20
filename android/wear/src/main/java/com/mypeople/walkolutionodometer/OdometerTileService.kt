@@ -29,6 +29,7 @@ import androidx.wear.tiles.RequestBuilders.TileRequest
 import androidx.wear.tiles.TileBuilders.Tile
 import androidx.wear.tiles.TileService
 import androidx.wear.protolayout.ActionBuilders
+import androidx.wear.watchface.complications.datasource.ComplicationDataSourceUpdateRequester
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.CoroutineScope
@@ -42,6 +43,9 @@ private const val RESOURCES_VERSION = "1"
 
 class OdometerTileService : TileService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    // Track last displayed complication value to avoid unnecessary updates
+    private var lastDisplayedDistance: String? = null
 
     override fun onTileRequest(requestParams: TileRequest): ListenableFuture<Tile> {
         val deviceParams = requestParams.deviceConfiguration
@@ -79,6 +83,45 @@ class OdometerTileService : TileService() {
     override fun onTileEnterEvent(requestParams: TileEnterEvent) {
         // Request update when tile is visible
         getUpdater(this).requestUpdate(OdometerTileService::class.java)
+
+        // Also trigger complication update if the displayed value has changed
+        requestComplicationUpdateIfNeeded()
+    }
+
+    /**
+     * Requests a complication update only if the displayed value has changed.
+     */
+    private fun requestComplicationUpdateIfNeeded() {
+        serviceScope.launch {
+            try {
+                val data = WearDataListenerService.odometerData.first()
+                val displayedDistance = String.format("%.1f", data.sessionDistance) + data.distanceUnit
+
+                // Only update if the displayed value has actually changed
+                if (displayedDistance != lastDisplayedDistance) {
+                    lastDisplayedDistance = displayedDistance
+                    requestComplicationUpdate()
+                }
+            } catch (e: Exception) {
+                // Silently ignore if no complications are active
+            }
+        }
+    }
+
+    /**
+     * Requests an immediate update of all active complications.
+     */
+    private fun requestComplicationUpdate() {
+        try {
+            val componentName = ComponentName(this, OdometerComplicationService::class.java)
+            val requester = ComplicationDataSourceUpdateRequester.create(
+                context = this,
+                complicationDataSourceComponent = componentName
+            )
+            requester.requestUpdateAll()
+        } catch (e: Exception) {
+            // Silently ignore if no complications are active
+        }
     }
 
     private fun createTileLayout(

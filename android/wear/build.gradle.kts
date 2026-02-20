@@ -52,6 +52,9 @@ dependencies {
     implementation(libs.wear.protolayout.material)
     implementation(libs.guava)
 
+    // Wear OS Complications
+    implementation(libs.wear.watchface.complications.data.source)
+
     // Wear OS integration
     implementation(libs.play.services.wearable)
 
