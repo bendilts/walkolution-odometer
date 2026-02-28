@@ -69,11 +69,10 @@
 #define OLED_SCL_PIN 27
 #define OLED_ADDR 0x3C
 
-#ifndef VOLTAGE_CHECK_INTERVAL_MS
-#define VOLTAGE_CHECK_INTERVAL_MS 1000
+#ifndef PERIPHERAL_STATUS_CHECK_INTERVAL_MS
+#define PERIPHERAL_STATUS_CHECK_INTERVAL_MS 1000
 #endif
 
-#define BLE_VOLTAGE_THRESHOLD_MV 4200      // 4.2V minimum for Bluetooth
 #define BLE_UPDATE_INTERVAL_MS 1000        // Send data to phone every second
 
 // Perform initialisation
@@ -370,11 +369,6 @@ static bool ble_notification_enabled = false;
 static hci_con_handle_t connection_handle;
 // Note: odometer_characteristic_handle is defined in the generated header as:
 // ATT_CHARACTERISTIC_12345678_1234_5678_1234_56789ABCDEF1_01_VALUE_HANDLE
-
-// BLE activation delay tracking (requires voltage to be stable for 15 seconds)
-#define BLE_ACTIVATION_DELAY_MS 15000                     // 15 seconds
-static uint32_t ble_voltage_above_threshold_start_ms = 0; // When voltage first went above threshold
-static bool ble_voltage_is_above_threshold = false;       // Current voltage state
 
 // Connection status is now integrated into update_oled_session() and update_oled_totals()
 
@@ -832,6 +826,10 @@ int main()
     log_printf("Initializing odometer...\n");
     odometer_init();
 
+    // Initialize speed tracking
+    log_printf("Initializing speed tracking...\n");
+    speed_init();
+
     // Initialize rotation detection IRQ
     log_printf("Initializing rotation detection on pin %d...\n", SENSOR_PIN);
     irq_init(SENSOR_PIN);
@@ -855,7 +853,7 @@ int main()
     bool showing_session = true; // True = session screen, False = totals screen
     uint32_t last_display_switch_ms = to_ms_since_boot(get_absolute_time());
     uint32_t last_update_ms = 0;
-    uint32_t last_voltage_check_ms = 0;
+    uint32_t last_peripheral_status_check_ms = 0;
     bool oled_is_on = true; // Track OLED power state
 
     // BLE data update tracking
@@ -872,7 +870,6 @@ int main()
     update_oled_session(ble_connected, ble_advertising);
 
     log_printf("=== ENTERING MAIN LOOP ===\n");
-    log_printf("BLE_VOLTAGE_THRESHOLD_MV = %d\n", BLE_VOLTAGE_THRESHOLD_MV);
 
     while (true)
     {
@@ -891,8 +888,8 @@ int main()
         // LED control is handled directly in the GPIO IRQ handler
         bool rotation_detected = odometer_process();
 
-        // Check voltage periodically and control BLE and OLED
-        if ((current_time_ms - last_voltage_check_ms) >= VOLTAGE_CHECK_INTERVAL_MS)
+        // Check peripheral status periodically and control BLE and OLED
+        if ((current_time_ms - last_peripheral_status_check_ms) >= PERIPHERAL_STATUS_CHECK_INTERVAL_MS)
         {
             uint16_t voltage_mv = odometer_read_voltage();
             float current_speed = speed_get_running_avg(user_settings_is_metric());
@@ -931,41 +928,15 @@ int main()
                 }
             }
 
-            // Track voltage state for BLE activation delay
-            // Voltage must stay above threshold for BLE_ACTIVATION_DELAY_MS before starting BLE
-            if (voltage_mv >= BLE_VOLTAGE_THRESHOLD_MV)
+            // Start BLE advertising based on walking speed (not voltage)
+            // BLE will be activated after walking faster than slow walking threshold (1.5 mph) for 15 seconds
+            if (!ble_advertising && speed_allows_ble())
             {
-                // Voltage is above threshold
-                if (!ble_voltage_is_above_threshold)
-                {
-                    // Voltage just went above threshold - start the timer
-                    ble_voltage_is_above_threshold = true;
-                    ble_voltage_above_threshold_start_ms = current_time_ms;
-                }
-                else if (!ble_advertising)
-                {
-                    // Check if we've been above threshold long enough
-                    uint32_t time_above_threshold_ms = current_time_ms - ble_voltage_above_threshold_start_ms;
-                    if (time_above_threshold_ms >= BLE_ACTIVATION_DELAY_MS)
-                    {
-                        log_printf("*** STARTING BLE ADVERTISING (voltage stable at %u mV for %lu ms) ***\n",
-                                   voltage_mv, time_above_threshold_ms);
-                        start_ble_advertising();
-                    }
-                }
-            }
-            else
-            {
-                // Voltage is below threshold
-                if (ble_voltage_is_above_threshold)
-                {
-                    // Voltage dropped below threshold - reset the timer
-                    ble_voltage_is_above_threshold = false;
-                    ble_voltage_above_threshold_start_ms = 0;
-                }
+                log_printf("*** STARTING BLE ADVERTISING (walking speed triggered activation) ***\n");
+                start_ble_advertising();
             }
 
-            last_voltage_check_ms = current_time_ms;
+            last_peripheral_status_check_ms = current_time_ms;
         }
 
         // Poll cyw43 for BLE - MUST be called regularly for BLE to work

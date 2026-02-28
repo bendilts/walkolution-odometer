@@ -44,4 +44,10 @@ float speed_get_session_avg(uint32_t session_rotations, uint32_t session_time_se
 // current_time_ms: current system time in milliseconds
 bool speed_allows_oled_display(uint32_t current_time_ms);
 
+// Check if BLE should be activated based on walking speed
+// Returns false on startup, then true forever after walking faster than
+// the slow walking threshold (1.5 mph) for 15 consecutive seconds
+// Note: This is a read-only function - state updates happen in speed_update()
+bool speed_allows_ble(void);
+
 #endif // SPEED_H

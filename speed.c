@@ -36,11 +36,21 @@ static speed_window_t speed_window = {0};
 static uint32_t slow_walking_range_start_ms = 0; // When speed first entered slow walking range
 static bool speed_was_in_slow_walking_range = false; // Previous state
 
+// BLE activation tracking based on walking speed
+// Track how long speed has been continuously above slow walking threshold
+#define BLE_ACTIVATION_SPEED_TIME_MS 15000 // 15 seconds
+static uint32_t fast_walking_range_start_ms = 0; // When speed first exceeded slow walking threshold
+static bool speed_above_slow_walking_threshold = false; // Current state
+static bool ble_has_been_activated = false; // Once activated, stays true forever
+
 void speed_init(void)
 {
     memset(&speed_window, 0, sizeof(speed_window));
     slow_walking_range_start_ms = 0;
     speed_was_in_slow_walking_range = false;
+    fast_walking_range_start_ms = 0;
+    speed_above_slow_walking_threshold = false;
+    ble_has_been_activated = false;
 }
 
 void speed_reset(void)
@@ -48,6 +58,7 @@ void speed_reset(void)
     memset(&speed_window, 0, sizeof(speed_window));
     slow_walking_range_start_ms = 0;
     speed_was_in_slow_walking_range = false;
+    // Note: Do NOT reset BLE activation state - once BLE is activated, it stays active forever
     log_printf("[SPEED] Speed window reset (starting new session)\n");
 }
 
@@ -92,6 +103,49 @@ void speed_update(uint32_t session_rotations, uint32_t current_time_ms)
             log_printf("[SPEED] Exited slow walking range (speed %.2f mph)\n", current_speed_mph);
             speed_was_in_slow_walking_range = false;
             slow_walking_range_start_ms = 0;
+        }
+    }
+
+    // Update BLE activation tracking (only if not already permanently activated)
+    if (!ble_has_been_activated)
+    {
+        // Check if speed is above slow walking threshold (>= 1.5 mph)
+        bool speed_is_above_threshold = (current_speed_mph >= SLOW_WALK_THRESHOLD_MPH);
+
+        if (speed_is_above_threshold)
+        {
+            // Speed is above threshold
+            if (!speed_above_slow_walking_threshold)
+            {
+                // Just exceeded threshold - start timer
+                fast_walking_range_start_ms = current_time_ms;
+                speed_above_slow_walking_threshold = true;
+                log_printf("[SPEED] Speed exceeded slow walking threshold (%.2f mph), starting 15-second BLE activation timer\n",
+                           current_speed_mph);
+            }
+            else
+            {
+                // Already above threshold - check if we've been there long enough
+                uint32_t time_above_threshold_ms = current_time_ms - fast_walking_range_start_ms;
+                if (time_above_threshold_ms >= BLE_ACTIVATION_SPEED_TIME_MS)
+                {
+                    // Been above threshold for 15 seconds - activate BLE permanently
+                    ble_has_been_activated = true;
+                    log_printf("[SPEED] *** BLE ACTIVATED *** (speed above %.2f mph for %lu ms)\n",
+                               SLOW_WALK_THRESHOLD_MPH, time_above_threshold_ms);
+                }
+            }
+        }
+        else
+        {
+            // Speed dropped below threshold - reset timer
+            if (speed_above_slow_walking_threshold)
+            {
+                log_printf("[SPEED] Speed dropped below threshold (%.2f mph), resetting BLE activation timer\n",
+                           current_speed_mph);
+                speed_above_slow_walking_threshold = false;
+                fast_walking_range_start_ms = 0;
+            }
         }
     }
 }
@@ -159,4 +213,14 @@ bool speed_allows_oled_display(uint32_t current_time_ms)
 
     // In slow walking range but less than 5 seconds - OLED still allowed
     return true;
+}
+
+bool speed_allows_ble(void)
+{
+    // Read-only function: just check if BLE has been activated
+    // (State updates happen in speed_update())
+    //
+    // Returns false on startup, then true forever after walking faster than
+    // the slow walking threshold (1.5 mph) for 15 consecutive seconds
+    return ble_has_been_activated;
 }
