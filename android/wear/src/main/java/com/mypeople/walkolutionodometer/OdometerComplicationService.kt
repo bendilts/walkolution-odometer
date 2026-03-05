@@ -30,28 +30,24 @@ class OdometerComplicationService : ComplicationDataSourceService() {
     }
 
     override fun getPreviewData(type: ComplicationType): ComplicationData? {
-        val icon = MonochromaticImage.Builder(
-            Icon.createWithResource(this, R.drawable.ic_walkolution_small)
-        ).build()
-
         val tapAction = createTapAction()
 
         return when (type) {
             ComplicationType.SHORT_TEXT -> {
                 ShortTextComplicationData.Builder(
-                    text = PlainComplicationText.Builder("3.2mi").build(),
+                    text = PlainComplicationText.Builder("3.2").build(),
                     contentDescription = PlainComplicationText.Builder("3.2 miles unreported").build()
                 )
-                    .setMonochromaticImage(icon)
+                    .setTitle(PlainComplicationText.Builder("mi").build())
                     .setTapAction(tapAction)
                     .build()
             }
             ComplicationType.LONG_TEXT -> {
                 LongTextComplicationData.Builder(
-                    text = PlainComplicationText.Builder("3.2 mi unreported").build(),
+                    text = PlainComplicationText.Builder("3.2 unreported").build(),
                     contentDescription = PlainComplicationText.Builder("3.2 miles unreported").build()
                 )
-                    .setMonochromaticImage(icon)
+                    .setTitle(PlainComplicationText.Builder("mi").build())
                     .setTapAction(tapAction)
                     .build()
             }
@@ -62,8 +58,8 @@ class OdometerComplicationService : ComplicationDataSourceService() {
                     max = 6.0f,
                     contentDescription = PlainComplicationText.Builder("3.2 of 6.0 miles").build()
                 )
-                    .setText(PlainComplicationText.Builder("3.2mi").build())
-                    .setMonochromaticImage(icon)
+                    .setText(PlainComplicationText.Builder("3.2").build())
+                    .setTitle(PlainComplicationText.Builder("mi").build())
                     .setTapAction(tapAction)
                     .build()
             }
@@ -97,17 +93,13 @@ class OdometerComplicationService : ComplicationDataSourceService() {
     private fun createShortTextComplication(data: OdometerData): ComplicationData {
         val distance = data.sessionDistance
         val unit = data.distanceUnit
-        val text = "${formatSessionDistance(distance)}$unit"
-
-        val icon = MonochromaticImage.Builder(
-            Icon.createWithResource(this, R.drawable.ic_walkolution_small)
-        ).build()
+        val text = formatSessionDistance(distance)
 
         return ShortTextComplicationData.Builder(
             text = PlainComplicationText.Builder(text).build(),
             contentDescription = PlainComplicationText.Builder("$distance $unit unreported").build()
         )
-            .setMonochromaticImage(icon)
+            .setTitle(PlainComplicationText.Builder(unit).build())
             .setTapAction(createTapAction())
             .build()
     }
@@ -115,17 +107,13 @@ class OdometerComplicationService : ComplicationDataSourceService() {
     private fun createLongTextComplication(data: OdometerData): ComplicationData {
         val distance = data.sessionDistance
         val unit = data.distanceUnit
-        val text = "${formatSessionDistance(distance)} $unit unreported"
-
-        val icon = MonochromaticImage.Builder(
-            Icon.createWithResource(this, R.drawable.ic_walkolution_small)
-        ).build()
+        val text = "${formatSessionDistance(distance)} unreported"
 
         return LongTextComplicationData.Builder(
             text = PlainComplicationText.Builder(text).build(),
-            contentDescription = PlainComplicationText.Builder(text).build()
+            contentDescription = PlainComplicationText.Builder("$distance $unit unreported").build()
         )
-            .setMonochromaticImage(icon)
+            .setTitle(PlainComplicationText.Builder(unit).build())
             .setTapAction(createTapAction())
             .build()
     }
@@ -134,7 +122,7 @@ class OdometerComplicationService : ComplicationDataSourceService() {
         val distance = data.sessionDistance
         val dailyGoal = data.dailyGoalMiles
         val unit = data.distanceUnit
-        val text = "${formatSessionDistance(distance)}$unit"
+        val text = formatSessionDistance(distance)
 
         // Convert daily goal to current units if metric
         val goalInCurrentUnits = if (data.metric) {
@@ -143,18 +131,17 @@ class OdometerComplicationService : ComplicationDataSourceService() {
             dailyGoal
         }
 
-        val icon = MonochromaticImage.Builder(
-            Icon.createWithResource(this, R.drawable.ic_walkolution_small)
-        ).build()
+        // Use the larger of distance or goal as max to ensure text always shows
+        val maxValue = maxOf(distance, goalInCurrentUnits)
 
         return RangedValueComplicationData.Builder(
             value = distance,
             min = 0f,
-            max = goalInCurrentUnits,
+            max = maxValue,
             contentDescription = PlainComplicationText.Builder("$distance of $goalInCurrentUnits $unit").build()
         )
             .setText(PlainComplicationText.Builder(text).build())
-            .setMonochromaticImage(icon)
+            .setTitle(PlainComplicationText.Builder(unit).build())
             .setTapAction(createTapAction())
             .build()
     }

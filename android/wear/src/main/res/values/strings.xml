@@ -3,4 +3,5 @@
     <string name="app_name">Walkolution</string>
     <string name="tile_label">Walkolution</string>
     <string name="complication_label">Walkolution Unreported</string>
+    <string name="speed_complication_label">Walkolution Speed</string>
 </resources>

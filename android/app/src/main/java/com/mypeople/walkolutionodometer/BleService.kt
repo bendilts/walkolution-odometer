@@ -339,9 +339,9 @@ class BleService : Service() {
         val data = _odometerData.value
         val status = _connectionStatus.value
 
-        val contentText = if (_isConnected.value && data.sessionRotations > 0) {
+        val contentText = if (_isConnected.value && data.unreportedMiles > 0) {
             String.format("%.2f mi • %s • %.1f mph",
-                data.sessionMiles, data.sessionTime, data.sessionAvgSpeed)
+                data.unreportedMiles, data.unreportedTime, data.sessionAvgSpeed)
         } else if (_isConnected.value) {
             "Connected - No active session"
         } else if (_scanning.value) {
