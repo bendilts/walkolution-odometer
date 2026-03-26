@@ -9,7 +9,7 @@
 // Constants
 #define SPEED_WINDOW_SECONDS 5             // 5-second running average for speed
 #define SLOW_WALKING_DETECTION_TIME_MS 5000 // Time speed must stay in slow walking range before OLED turns off
-#define SLOW_WALK_THRESHOLD_MPH 1.5f       // Turn off OLED when speed is >0 but <1.5 mph (always mph, regardless of metric setting)
+#define SLOW_WALK_THRESHOLD_MPH 1.2f       // Turn off OLED when speed is >0 but <1.2 mph (always mph, regardless of metric setting)
 
 // Conversion constants
 // Each rotation = 34.56 cm = 0.3456 meters = 0.0002147 miles = 0.0003456 km
@@ -38,7 +38,7 @@ static bool speed_was_in_slow_walking_range = false; // Previous state
 
 // BLE activation tracking based on walking speed
 // Track how long speed has been continuously above slow walking threshold
-#define BLE_ACTIVATION_SPEED_TIME_MS 15000 // 15 seconds
+#define BLE_ACTIVATION_SPEED_TIME_MS 5000 // 5 seconds
 static uint32_t fast_walking_range_start_ms = 0; // When speed first exceeded slow walking threshold
 static bool speed_above_slow_walking_threshold = false; // Current state
 static bool ble_has_been_activated = false; // Once activated, stays true forever
@@ -120,7 +120,7 @@ void speed_update(uint32_t session_rotations, uint32_t current_time_ms)
                 // Just exceeded threshold - start timer
                 fast_walking_range_start_ms = current_time_ms;
                 speed_above_slow_walking_threshold = true;
-                log_printf("[SPEED] Speed exceeded slow walking threshold (%.2f mph), starting 15-second BLE activation timer\n",
+                log_printf("[SPEED] Speed exceeded slow walking threshold (%.2f mph), starting 5-second BLE activation timer\n",
                            current_speed_mph);
             }
             else
@@ -129,7 +129,7 @@ void speed_update(uint32_t session_rotations, uint32_t current_time_ms)
                 uint32_t time_above_threshold_ms = current_time_ms - fast_walking_range_start_ms;
                 if (time_above_threshold_ms >= BLE_ACTIVATION_SPEED_TIME_MS)
                 {
-                    // Been above threshold for 15 seconds - activate BLE permanently
+                    // Been above threshold for 5 seconds - activate BLE permanently
                     ble_has_been_activated = true;
                     log_printf("[SPEED] *** BLE ACTIVATED *** (speed above %.2f mph for %lu ms)\n",
                                SLOW_WALK_THRESHOLD_MPH, time_above_threshold_ms);
@@ -221,6 +221,6 @@ bool speed_allows_ble(void)
     // (State updates happen in speed_update())
     //
     // Returns false on startup, then true forever after walking faster than
-    // the slow walking threshold (1.5 mph) for 15 consecutive seconds
+    // the slow walking threshold (1.2 mph) for 5 consecutive seconds
     return ble_has_been_activated;
 }

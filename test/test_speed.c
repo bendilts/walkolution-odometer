@@ -248,7 +248,7 @@ void test_oled_allowed_when_stopped(void) {
 }
 
 void test_oled_allowed_when_walking_fast(void) {
-    // Walking at ~3 mph (above 1.5 mph threshold)
+    // Walking at ~3 mph (above 1.2 mph threshold)
     // 3 mph = 3 miles/hour / 0.0002147 miles/rotation = ~13,972 rotations/hour
     // = ~3.88 rotations/second, use 4 for simplicity
 
@@ -256,13 +256,13 @@ void test_oled_allowed_when_walking_fast(void) {
     speed_update(4, 1000);   // 4 rotations/sec = 14,400 rot/hr = ~3.09 mph
     speed_update(8, 2000);
 
-    // Should NOT be in slow walking range (speed >= 1.5 mph)
+    // Should NOT be in slow walking range (speed >= 1.2 mph)
     TEST_ASSERT_TRUE_MESSAGE(speed_allows_oled_display(2000),
-                             "OLED should be allowed when walking fast (>1.5 mph)");
+                             "OLED should be allowed when walking fast (>1.2 mph)");
 }
 
 void test_oled_enters_slow_walking_range(void) {
-    // Walking at ~1.0 mph (below 1.5 mph threshold but above 0)
+    // Walking at ~1.0 mph (below 1.2 mph threshold but above 0)
     // 1.0 mph = 1 / 0.0002147 = ~4658 rotations/hour = ~1.29 rotations/second
     // Use 1.3 rotations/second
 
@@ -350,16 +350,16 @@ void test_oled_timer_resets_when_exiting_slow_range_to_stopped(void) {
 }
 
 void test_oled_threshold_exactly_at_1_5_mph(void) {
-    // Test boundary: exactly 1.5 mph should NOT be in slow walking range
-    // 1.5 mph = 1.5 / 0.0002147 = 6986 rotations/hour = 1.94 rotations/second
+    // Test boundary: exactly 1.2 mph should NOT be in slow walking range
+    // 1.2 mph = 1.2 / 0.0002147 = 5589 rotations/hour = 1.55 rotations/second
     // Use 2 rotations/second which gives ~1.546 mph
 
     speed_update(0, 0);
     speed_update(2, 1000);   // ~1.546 mph (just above threshold)
 
-    // Should NOT be in slow walking range (threshold is speed < 1.5, this is >= 1.5)
-    // But actually 1.546 is still above 1.5, so let's be more precise
-    // Let's use 1.9 rotations/second = 6840 rotations/hour = 1.468 mph (below threshold)
+    // Should NOT be in slow walking range (threshold is speed < 1.2, this is >= 1.2)
+    // But actually 1.546 is still above 1.2, so let's be more precise
+    // Let's use 1.9 rotations/second = 6840 rotations/hour = 1.468 mph (above threshold)
 
     speed_init();  // Reset
     speed_update(0, 0);
@@ -372,14 +372,14 @@ void test_oled_threshold_exactly_at_1_5_mph(void) {
 
     // Been in slow range for 5 seconds
     TEST_ASSERT_FALSE_MESSAGE(speed_allows_oled_display(6000),
-                              "OLED should be off for speed well below 1.5 mph");
+                              "OLED should be off for speed well below 1.2 mph");
 }
 
 void test_oled_complex_scenario_enter_exit_reenter(void) {
     // Complex scenario: enter, stay 3 seconds, exit, re-enter, stay 5 seconds
 
     speed_update(0, 0);
-    speed_update(1, 1000);   // Enter slow range at t=1000
+    speed_update(1, 1000);   // Enter slow range at t=1000 (~0.77 mph)
     speed_update(2, 2000);   // In range 1 second
     speed_update(3, 3000);   // In range 2 seconds
 
@@ -387,22 +387,36 @@ void test_oled_complex_scenario_enter_exit_reenter(void) {
     TEST_ASSERT_TRUE_MESSAGE(speed_allows_oled_display(3000),
                              "OLED allowed after 2 seconds in slow range");
 
-    // Speed up (exit slow range)
-    speed_update(7, 4000);   // Exit to fast walking
+    // Speed up significantly (exit slow range)
+    speed_update(10, 4000);   // Big jump to fast walking
+    speed_update(14, 5000);   // Continue fast walking (4 rot/s = ~3.09 mph)
+    speed_update(18, 6000);   // Still fast
 
-    TEST_ASSERT_TRUE_MESSAGE(speed_allows_oled_display(4000),
+    TEST_ASSERT_TRUE_MESSAGE(speed_allows_oled_display(6000),
                              "OLED allowed after exiting slow range");
 
-    // Slow down again (re-enter slow range)
-    speed_update(8, 5000);   // Re-enter at t=5000
-    speed_update(9, 6000);   // 1 second in range
-    speed_update(10, 7000);  // 2 seconds
-    speed_update(11, 8000);  // 3 seconds
-    speed_update(12, 9000);  // 4 seconds
-    speed_update(13, 10000); // 5 seconds since re-entry
+    // Slow down again (re-enter slow range) - need to wait for window to clear fast walking
+    // Continue fast for a bit longer, then slow down
+    speed_update(22, 7000);   // Still fast
+    speed_update(26, 8000);   // Still fast
+    speed_update(30, 9000);   // Still fast
 
-    // Should now disallow OLED (5 seconds since t=5000)
-    TEST_ASSERT_FALSE_MESSAGE(speed_allows_oled_display(10000),
+    // Now slow down - need to wait for 5-second window to clear the fast walking
+    speed_update(31, 10000);  // Slow down (window still has fast data)
+    speed_update(32, 11000);  // 1 rotation/sec
+    speed_update(33, 12000);  // 1 rotation/sec
+    speed_update(34, 13000);  // 1 rotation/sec
+    speed_update(35, 14000);  // 1 rotation/sec - window now 14000-9000, has 30-35 = 5 rot in 5s = 0.77 mph
+
+    // Now in slow range, timer starts at t=14000
+    speed_update(36, 15000);  // 1 second in slow range
+    speed_update(37, 16000);  // 2 seconds
+    speed_update(38, 17000);  // 3 seconds
+    speed_update(39, 18000);  // 4 seconds
+    speed_update(40, 19000);  // 5 seconds since entering slow range at t=14000
+
+    // At t=19000, been in slow range for 5 seconds (since t=14000)
+    TEST_ASSERT_FALSE_MESSAGE(speed_allows_oled_display(19000),
                               "OLED disallowed after 5 seconds in slow range on re-entry");
 }
 
@@ -428,66 +442,46 @@ void test_ble_disallowed_when_stopped(void) {
 }
 
 void test_ble_disallowed_in_slow_walking_range(void) {
-    // Walking at ~1.0 mph (below 1.5 mph threshold)
+    // Walking at ~1.0 mph (below 1.2 mph threshold)
     speed_update(0, 0);
     speed_update(1, 1000);   // ~0.77 mph
     speed_update(2, 2000);
     speed_update(3, 3000);
     speed_update(4, 4000);
 
-    // Even after several seconds, should not activate BLE if speed < 1.5 mph
+    // Even after several seconds, should not activate BLE if speed < 1.2 mph
     TEST_ASSERT_FALSE_MESSAGE(speed_allows_ble(),
-                               "BLE should remain disallowed in slow walking range (<1.5 mph)");
+                               "BLE should remain disallowed in slow walking range (<1.2 mph)");
 }
 
-void test_ble_disallowed_for_first_15_seconds_above_threshold(void) {
-    // Walking at ~3 mph (above 1.5 mph threshold)
+void test_ble_disallowed_for_first_5_seconds_above_threshold(void) {
+    // Walking at ~3 mph (above 1.2 mph threshold)
     // 4 rotations/sec = 14,400 rot/hr = ~3.09 mph
     speed_update(0, 0);
     speed_update(4, 1000);   // Enter fast walking at t=1000ms
     speed_update(8, 2000);
     speed_update(12, 3000);
     speed_update(16, 4000);
-    speed_update(20, 5000);
-    speed_update(24, 6000);
-    speed_update(28, 7000);
-    speed_update(32, 8000);
-    speed_update(36, 9000);
-    speed_update(40, 10000);
-    speed_update(44, 11000);
-    speed_update(48, 12000);
-    speed_update(52, 13000);
-    speed_update(56, 14000);
-    speed_update(60, 15000);  // t=15000ms (14 seconds since entering at t=1000ms)
+    speed_update(20, 5000);  // t=5000ms (4 seconds since entering at t=1000ms)
 
-    // Should still be disallowed (need 15 seconds, only been 14)
+    // Should still be disallowed (need 5 seconds, only been 4)
     TEST_ASSERT_FALSE_MESSAGE(speed_allows_ble(),
-                               "BLE should remain disallowed before 15 seconds above threshold");
+                               "BLE should remain disallowed before 5 seconds above threshold");
 }
 
-void test_ble_activated_after_15_seconds_above_threshold(void) {
-    // Walking at ~3 mph (above 1.5 mph threshold) for 15+ seconds
+void test_ble_activated_after_5_seconds_above_threshold(void) {
+    // Walking at ~3 mph (above 1.2 mph threshold) for 5+ seconds
     speed_update(0, 0);
     speed_update(4, 1000);   // Enter fast walking at t=1000ms
     speed_update(8, 2000);
     speed_update(12, 3000);
     speed_update(16, 4000);
     speed_update(20, 5000);
-    speed_update(24, 6000);
-    speed_update(28, 7000);
-    speed_update(32, 8000);
-    speed_update(36, 9000);
-    speed_update(40, 10000);
-    speed_update(44, 11000);
-    speed_update(48, 12000);
-    speed_update(52, 13000);
-    speed_update(56, 14000);
-    speed_update(60, 15000);
-    speed_update(64, 16000);  // t=16000ms (15 seconds since entering at t=1000ms)
+    speed_update(24, 6000);  // t=6000ms (5 seconds since entering at t=1000ms)
 
     // Should now be activated permanently
     TEST_ASSERT_TRUE_MESSAGE(speed_allows_ble(),
-                              "BLE should be activated after 15 seconds above threshold");
+                              "BLE should be activated after 5 seconds above threshold");
 }
 
 void test_ble_timer_resets_when_dropping_below_threshold(void) {
@@ -495,69 +489,54 @@ void test_ble_timer_resets_when_dropping_below_threshold(void) {
     speed_update(0, 0);
     speed_update(4, 1000);   // Enter fast walking at t=1000ms
     speed_update(8, 2000);
-    speed_update(12, 3000);
-    speed_update(16, 4000);
-    speed_update(20, 5000);
-    speed_update(24, 6000);
-    speed_update(28, 7000);   // t=7000ms (6 seconds so far)
+    speed_update(12, 3000);   // t=3000ms (2 seconds so far)
 
-    // Now slow down (below 1.5 mph threshold)
-    speed_update(29, 8000);   // Slow down at t=8000ms
-    speed_update(30, 9000);   // Speed drops below threshold
+    // Now slow down (below 1.2 mph threshold)
+    speed_update(13, 4000);   // Slow down at t=4000ms
+    speed_update(14, 5000);   // Speed drops below threshold
 
     // Timer should reset, BLE should remain disallowed
     TEST_ASSERT_FALSE_MESSAGE(speed_allows_ble(),
                                "BLE should remain disallowed when speed drops below threshold");
 
     // Now speed up again
-    speed_update(34, 10000);  // Fast walking again at t=10000ms
-    speed_update(38, 11000);
-    speed_update(42, 12000);
-    // ... continue for full 15 seconds from t=10000ms
-    speed_update(46, 13000);
-    speed_update(50, 14000);
-    speed_update(54, 15000);
-    speed_update(58, 16000);
-    speed_update(62, 17000);
-    speed_update(66, 18000);
-    speed_update(70, 19000);
-    speed_update(74, 20000);
-    speed_update(78, 21000);
-    speed_update(82, 22000);
-    speed_update(86, 23000);
-    speed_update(90, 24000);
-    speed_update(94, 25000);  // t=25000ms (15 seconds since re-entering at t=10000ms)
+    speed_update(18, 6000);  // Fast walking again at t=6000ms
+    speed_update(22, 7000);
+    speed_update(26, 8000);
+    speed_update(30, 9000);
+    speed_update(34, 10000);
+    speed_update(38, 11000);  // t=11000ms (5 seconds since re-entering at t=6000ms)
 
-    // Now should be activated (timer started fresh at t=10000ms)
+    // Now should be activated (timer started fresh at t=6000ms)
     TEST_ASSERT_TRUE_MESSAGE(speed_allows_ble(),
-                              "BLE should activate after 15 seconds on second attempt");
+                              "BLE should activate after 5 seconds on second attempt");
 }
 
 void test_ble_stays_activated_forever(void) {
     // Activate BLE
     speed_update(0, 0);
-    for (int i = 1; i <= 16; i++) {
+    for (int i = 1; i <= 6; i++) {
         speed_update(4 * i, i * 1000);
     }
 
     // BLE should be active
     TEST_ASSERT_TRUE_MESSAGE(speed_allows_ble(),
-                              "BLE should be active after 15 seconds");
+                              "BLE should be active after 5 seconds");
 
     // Now stop walking
-    speed_update(64, 17000);
-    speed_update(64, 18000);
-    speed_update(64, 19000);
-    speed_update(64, 20000);
+    speed_update(24, 7000);
+    speed_update(24, 8000);
+    speed_update(24, 9000);
+    speed_update(24, 10000);
 
     // BLE should STILL be active (stays active forever)
     TEST_ASSERT_TRUE_MESSAGE(speed_allows_ble(),
                               "BLE should remain active after stopping");
 
     // Now walk slowly
-    speed_update(65, 21000);
-    speed_update(66, 22000);
-    speed_update(67, 23000);
+    speed_update(25, 11000);
+    speed_update(26, 12000);
+    speed_update(27, 13000);
 
     // BLE should STILL be active
     TEST_ASSERT_TRUE_MESSAGE(speed_allows_ble(),
@@ -567,12 +546,12 @@ void test_ble_stays_activated_forever(void) {
 void test_ble_stays_activated_after_reset(void) {
     // Activate BLE
     speed_update(0, 0);
-    for (int i = 1; i <= 16; i++) {
+    for (int i = 1; i <= 6; i++) {
         speed_update(4 * i, i * 1000);
     }
 
     TEST_ASSERT_TRUE_MESSAGE(speed_allows_ble(),
-                              "BLE should be active after 15 seconds");
+                              "BLE should be active after 5 seconds");
 
     // Reset speed (simulating new session)
     speed_reset();
@@ -582,25 +561,25 @@ void test_ble_stays_activated_after_reset(void) {
                               "BLE should remain active after speed_reset()");
 }
 
-void test_ble_threshold_exactly_at_1_5_mph(void) {
-    // Test boundary: exactly at 1.5 mph threshold
-    // 1.5 mph = 6986 rotations/hour = 1.94 rotations/second
+void test_ble_threshold_exactly_at_1_2_mph(void) {
+    // Test boundary: exactly at 1.2 mph threshold
+    // 1.2 mph = 5589 rotations/hour = 1.55 rotations/second
     // Use 2 rotations/second which gives ~1.546 mph (just above threshold)
 
     speed_update(0, 0);
-    speed_update(2, 1000);   // ~1.546 mph (>= 1.5 mph threshold)
+    speed_update(2, 1000);   // ~1.546 mph (>= 1.2 mph threshold)
 
-    for (int i = 2; i <= 16; i++) {
+    for (int i = 2; i <= 6; i++) {
         speed_update(2 * i, i * 1000);
     }
 
-    // Should be activated (speed >= 1.5 mph)
+    // Should be activated (speed >= 1.2 mph)
     TEST_ASSERT_TRUE_MESSAGE(speed_allows_ble(),
-                              "BLE should activate at exactly 1.5 mph threshold");
+                              "BLE should activate at exactly 1.2 mph threshold");
 }
 
 void test_ble_just_below_threshold_never_activates(void) {
-    // Test just below 1.5 mph - should never activate
+    // Test just below 1.2 mph - should never activate
     // Use 1 rotation/second = 3600 rot/hr = 0.773 mph
 
     speed_update(0, 0);
@@ -608,9 +587,9 @@ void test_ble_just_below_threshold_never_activates(void) {
         speed_update(i, i * 1000);
     }
 
-    // Should never activate (speed < 1.5 mph)
+    // Should never activate (speed < 1.2 mph)
     TEST_ASSERT_FALSE_MESSAGE(speed_allows_ble(),
-                               "BLE should not activate below 1.5 mph threshold");
+                               "BLE should not activate below 1.2 mph threshold");
 }
 
 void test_ble_activation_independent_of_oled_state(void) {
@@ -632,30 +611,20 @@ void test_ble_activation_independent_of_oled_state(void) {
     TEST_ASSERT_FALSE_MESSAGE(speed_allows_ble(),
                                "BLE should be off when walking slowly");
 
-    // Now speed up to fast walking (need big jump to get above 1.5 mph immediately)
-    // To get >1.5 mph over 5-second window, need >10 rotations in 5 seconds
+    // Now speed up to fast walking (need big jump to get above 1.2 mph immediately)
+    // To get >1.2 mph over 5-second window, need >8 rotations in 5 seconds
     speed_update(16, 7000);  // Big jump to start fast walking
     speed_update(20, 8000);  // Fast walking continues (4 rot/sec)
-    speed_update(18, 9000);
-    speed_update(22, 10000);
-    speed_update(26, 11000);
-    speed_update(30, 12000);
-    speed_update(34, 13000);
-    speed_update(38, 14000);
-    speed_update(42, 15000);
-    speed_update(46, 16000);
-    speed_update(50, 17000);
-    speed_update(54, 18000);
-    speed_update(58, 19000);
-    speed_update(62, 20000);
-    speed_update(66, 21000);
-    speed_update(70, 22000);  // t=22000ms (15 seconds of fast walking from t=7000)
+    speed_update(24, 9000);
+    speed_update(28, 10000);
+    speed_update(32, 11000);
+    speed_update(36, 12000);  // t=12000ms (5 seconds of fast walking from t=7000)
 
     // OLED should be back on (exited slow walking range)
-    TEST_ASSERT_TRUE_MESSAGE(speed_allows_oled_display(22000),
+    TEST_ASSERT_TRUE_MESSAGE(speed_allows_oled_display(12000),
                               "OLED should be on when walking fast");
 
-    // BLE should now be activated (15 seconds above threshold from t=7000 to t=22000)
+    // BLE should now be activated (5 seconds above threshold from t=7000 to t=12000)
     TEST_ASSERT_TRUE_MESSAGE(speed_allows_ble(),
                               "BLE should be activated independently of OLED state");
 }
@@ -734,12 +703,12 @@ int main(void) {
     RUN_TEST(test_ble_disallowed_initially);
     RUN_TEST(test_ble_disallowed_when_stopped);
     RUN_TEST(test_ble_disallowed_in_slow_walking_range);
-    RUN_TEST(test_ble_disallowed_for_first_15_seconds_above_threshold);
-    RUN_TEST(test_ble_activated_after_15_seconds_above_threshold);
+    RUN_TEST(test_ble_disallowed_for_first_5_seconds_above_threshold);
+    RUN_TEST(test_ble_activated_after_5_seconds_above_threshold);
     RUN_TEST(test_ble_timer_resets_when_dropping_below_threshold);
     RUN_TEST(test_ble_stays_activated_forever);
     RUN_TEST(test_ble_stays_activated_after_reset);
-    RUN_TEST(test_ble_threshold_exactly_at_1_5_mph);
+    RUN_TEST(test_ble_threshold_exactly_at_1_2_mph);
     RUN_TEST(test_ble_just_below_threshold_never_activates);
     RUN_TEST(test_ble_activation_independent_of_oled_state);
 
