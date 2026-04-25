@@ -19,6 +19,7 @@
 #define ROTATION_SAVE_INTERVAL 2500    // Save every 2500 rotations (~0.5 miles)
 #define TIME_SYNC_TIMEOUT_MS 60000     // Wait up to 60 seconds for time sync before allowing saves
 #define VOLTAGE_SAVE_THRESHOLD_MV 3300 // 3.3V - save when voltage drops below this
+#define IDLE_SAVE_TIMEOUT_MS 30000     // Save unsaved progress after 30 seconds of no rotations
 
 // Organized state structures
 typedef struct
@@ -103,10 +104,10 @@ uint16_t odometer_read_voltage(void)
     gpio_put(25, 0);
     gpio_set_pulls(25, false, true); // Pull down
 
-    // Restore GP29 to ALT function 7 (WiFi chip SPI CLK)
-    gpio_set_function(29, GPIO_FUNC_SIO);
+    // Restore GP29 for WiFi chip - set to NULL function and let CYW43 reclaim it
+    // GPIO_FUNC_SIO is wrong here as it breaks the WiFi SPI clock line
+    gpio_set_function(29, GPIO_FUNC_NULL);
     gpio_set_pulls(29, false, true); // Pull down
-    // Note: The CYW43 driver will reconfigure this as needed
 
     // Filter out invalid readings (< 1500mV likely means ADC glitch)
     if (vsys_mv < 1500)
@@ -340,6 +341,18 @@ bool odometer_process(void)
             counts.session_active_seconds += elapsed_seconds;
             counts.is_active = false;
         }
+    }
+
+    // Save unsaved progress after 30 seconds of idle (no new rotations)
+    // This prevents data loss if the device crashes or loses power while idle
+    if (counts.lifetime_rotations != save_state.last_saved_count &&
+        !rotation_detected &&
+        (current_time_ms - counts.last_rotation_time_ms) >= IDLE_SAVE_TIMEOUT_MS &&
+        (current_time_ms - save_state.last_save_time_ms) >= FLASH_SAVE_INTERVAL_MS)
+    {
+        log_printf("Idle save: persisting %lu unsaved rotations\n",
+                   counts.lifetime_rotations - save_state.last_saved_count);
+        odometer_save_count();
     }
 
     // Check voltage - save immediately if voltage drops below threshold (power loss imminent)

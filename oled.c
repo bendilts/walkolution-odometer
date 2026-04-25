@@ -11,17 +11,52 @@ static uint8_t oled_buffer[OLED_WIDTH * OLED_HEIGHT / 8];
 // Hardware configuration
 static i2c_inst_t* i2c_port;
 static uint8_t oled_addr;
+static uint8_t oled_sda_pin;
+static uint8_t oled_scl_pin;
+static uint32_t i2c_error_count = 0;
+
+// Forward declaration
+static void oled_hw_init(void);
+
+// Reinitialize I2C bus after errors
+static void oled_i2c_recover(void) {
+    log_printf("I2C recovery: reinitializing bus after %lu errors\n", i2c_error_count);
+    i2c_deinit(i2c_port);
+    i2c_init(i2c_port, 400 * 1000);
+    gpio_set_function(oled_sda_pin, GPIO_FUNC_I2C);
+    gpio_set_function(oled_scl_pin, GPIO_FUNC_I2C);
+    gpio_set_pulls(oled_sda_pin, true, false);
+    gpio_set_pulls(oled_scl_pin, true, false);
+    sleep_ms(10);
+    oled_hw_init();
+    i2c_error_count = 0;
+}
+
+// Check I2C result and recover if needed. Returns true if ok.
+static bool oled_i2c_check(int result) {
+    if (result >= 0) {
+        i2c_error_count = 0;
+        return true;
+    }
+    i2c_error_count++;
+    if (i2c_error_count >= 10) {
+        oled_i2c_recover();
+    }
+    return false;
+}
 
 // Send command to OLED
 static void oled_send_cmd(uint8_t cmd) {
     uint8_t buf[2] = {0x00, cmd};
-    i2c_write_timeout_us(i2c_port, oled_addr, buf, 2, false, 50000);
+    int ret = i2c_write_timeout_us(i2c_port, oled_addr, buf, 2, false, 50000);
+    oled_i2c_check(ret);
 }
 
 // Send data byte to OLED
 static void oled_send_data(uint8_t data) {
     uint8_t buf[2] = {0x40, data};
-    i2c_write_timeout_us(i2c_port, oled_addr, buf, 2, false, 50000);
+    int ret = i2c_write_timeout_us(i2c_port, oled_addr, buf, 2, false, 50000);
+    oled_i2c_check(ret);
 }
 
 // Hardware initialization for SH1106
@@ -70,6 +105,8 @@ static void oled_render(void) {
 void oled_init(void* i2c_inst, uint8_t sda_pin, uint8_t scl_pin, uint8_t addr) {
     i2c_port = (i2c_inst_t*)i2c_inst;
     oled_addr = addr;
+    oled_sda_pin = sda_pin;
+    oled_scl_pin = scl_pin;
 
     // Initialize I2C at 400kHz (standard speed, lower power than 1MHz)
     i2c_init(i2c_port, 400 * 1000);
